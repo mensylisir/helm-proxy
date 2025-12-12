@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(grep:*)",
+      "Bash(./helm-proxy:*)",
+      "Bash(curl:*)",
+      "Bash(helm search:*)",
+      "Bash(pkill:*)",
+      "Bash(python3 -m json.tool:*)",
+      "Bash(helm list:*)",
+      "Bash(kubectl get pods:*)",
+      "Bash(kubectl get pods -A)",
+      "Bash(taskkill:*)",
+      "Bash(netstat:*)",
+      "Bash(cat:*)",
+      "Bash(kill:*)",
+      "Bash(BashOutput:*)",
+      "Bash(killall:*)",
+      "Bash(echo $KUBECONFIG)",
+      "Bash(kubectl config view:*)",
+      "Bash(kubectl get ns)",
+      "Bash(kubectl describe:*)",
+      "Bash(kubectl get:*)",
+      "Bash(helm get values:*)"
+    ]
+  }
+}
