@@ -22,7 +22,9 @@
       "Bash(kubectl get ns)",
       "Bash(kubectl describe:*)",
       "Bash(kubectl get:*)",
-      "Bash(helm get values:*)"
+      "Bash(helm get values:*)",
+      "Bash(ls:*)",
+      "Bash(helm:*)"
     ]
   }
 }
