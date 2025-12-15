@@ -1,0 +1,80 @@
+# 离线环境生产配置 - Helm Proxy
+# 仅使用内部仓库和资源，无公网依赖
+
+server:
+  port: "8443"
+  readTimeout: 60
+  writeTimeout: 60
+  idleTimeout: 120
+  maxBodySize: 52428800  # 50MB
+
+helm:
+  driver: "secret"
+  timeout: 600  # 10分钟超时
+  maxHistory: 20
+  cacheDir: "/data/helm-cache"
+  configDir: "/data/helm-config"
+  repos:
+    # 仅内部仓库
+    myrepo: "http://registry.dev.rdev.tech:18091/repository/helm"
+    # 如果需要其他内部仓库，在这里添加
+
+security:
+  # CORS 配置
+  cors:
+    enabled: true
+    allowOrigins:
+      - "https://your-internal-domain.com"
+      - "https://admin.your-internal-domain.com"
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allowHeaders: ["Origin", "Content-Type", "Accept", "Authorization"]
+    allowCredentials: true
+    maxAge: 86400
+
+  # 限流配置
+  rateLimit:
+    enabled: true
+    rate: 200  # 每秒200个请求
+    burst: 400  # 突发400个请求
+    ipLimit: 2000  # 每IP每分钟限制
+    blockTime: 300  # 封禁5分钟
+    whitelist:
+      - "192.168.0.0/16"
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+
+  # 认证配置
+  auth:
+    enabled: true
+    jwtSecret: "CHANGE_ME_TO_256_BIT_SECRET_KEY_IN_PRODUCTION_OFFLINE"
+    jwtTokenTTL: 3600  # 1小时
+    apiKeyEnabled: true
+
+monitoring:
+  metricsEnabled: true
+  healthCheck:
+    path: "/v1/monitor/health"
+    timeout: 10
+    interval: 30
+  logLevel: "warn"  # 生产环境使用 warn，避免过多日志
+  logFormat: "json"  # 结构化日志
+
+# 生产环境优化
+production:
+  defaultTimeout: 600
+  defaultWait: false
+  maxRetries: 5
+  retryDelay: "30s"
+  validateNamespace: true
+  validateNodePort: true
+  nodeportRange: "30000-32767"
+  requireStrongPassword: true
+  passwordMinLength: 12
+  validateExternalId: true
+  maxConcurrentDeploys: 20  # 提高并发数
+  logLevel: "warn"
+
+  # 离线环境特殊配置
+  offlineMode: true
+  internalRegistryOnly: true
+  disableExternalRepos: true

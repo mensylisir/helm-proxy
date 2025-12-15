@@ -1,0 +1,120 @@
+# Prometheus 监控配置
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: helm-proxy-metrics
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+    monitoring: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: helm-proxy
+  endpoints:
+  - port: http
+    path: /v1/monitor/metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: true
+---
+# Prometheus 告警规则
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: helm-proxy-alerts
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+    prometheus: kube-prometheus
+spec:
+  groups:
+  - name: helm-proxy.rules
+    rules:
+    # 实例存活告警
+    - alert: HelmProxyInstanceDown
+      expr: up{job="helm-proxy"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 实例下线"
+        description: "Helm Proxy 实例 {{ $labels.instance }} 已经下线超过1分钟"
+
+    # 高错误率告警
+    - alert: HelmProxyHighErrorRate
+      expr: rate(helm_proxy_requests_total{status=~"5.."}[5m]) > 0.1
+      for: 2m
+      labels:
+        severity: warning
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 错误率过高"
+        description: "Helm Proxy 5xx错误率超过10%，当前值: {{ $value }}"
+
+    # 部署队列积压告警
+    - alert: HelmProxyDeploymentQueueBacklog
+      expr: helm_proxy_deployment_queue_size > 10
+      for: 5m
+      labels:
+        severity: warning
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 部署队列积压"
+        description: "Helm Proxy 部署队列积压超过10个，当前值: {{ $value }}"
+
+    # 高延迟告警
+    - alert: HelmProxyHighLatency
+      expr: histogram_quantile(0.95, rate(helm_proxy_request_duration_seconds_bucket[5m])) > 2
+      for: 5m
+      labels:
+        severity: warning
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 响应延迟过高"
+        description: "Helm Proxy 95%请求延迟超过2秒，当前值: {{ $value }}s"
+
+    # 内存使用率告警
+    - alert: HelmProxyHighMemoryUsage
+      expr: (helm_proxy_memory_usage_bytes / helm_proxy_memory_limit_bytes) > 0.9
+      for: 5m
+      labels:
+        severity: warning
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 内存使用率过高"
+        description: "Helm Proxy 内存使用率超过90%，当前值: {{ $value | humanizePercentage }}"
+
+    # CPU 使用率告警
+    - alert: HelmProxyHighCPUUsage
+      expr: (rate(helm_proxy_cpu_usage_seconds_total[5m]) / helm_proxy_cpu_limit_seconds_total) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy CPU使用率过高"
+        description: "Helm Proxy CPU使用率超过80%，当前值: {{ $value | humanizePercentage }}"
+
+    # Chart 下载失败告警
+    - alert: HelmProxyChartDownloadFailures
+      expr: rate(helm_proxy_chart_download_failures_total[5m]) > 0.05
+      for: 2m
+      labels:
+        severity: critical
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy Chart下载失败"
+        description: "Helm Proxy Chart下载失败率超过5%，当前值: {{ $value }}"
+
+    # 部署失败告警
+    - alert: HelmProxyDeploymentFailures
+      expr: rate(helm_proxy_deployment_failures_total[5m]) > 0.1
+      for: 2m
+      labels:
+        severity: critical
+        service: helm-proxy
+      annotations:
+        summary: "Helm Proxy 部署失败"
+        description: "Helm Proxy 部署失败率超过10%，当前值: {{ $value }}"

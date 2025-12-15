@@ -1,0 +1,57 @@
+name: Automated Backup
+
+on:
+  schedule:
+    # 每天凌晨2点执行
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Namespace to backup'
+        required: false
+        default: 'helm-proxy-system'
+      encryption_key:
+        description: 'Encryption key for backup'
+        required: false
+
+jobs:
+  backup:
+    name: Create Backup
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_BACKUP }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Run backup
+        run: |
+          export NAMESPACE=${{ github.event.inputs.namespace || 'helm-proxy-system' }}
+          export ENCRYPTION_KEY=${{ github.event.inputs.encryption_key || secrets.BACKUP_ENCRYPTION_KEY }}
+          ./backup-restore.sh backup --namespace $NAMESPACE --encrypt "$ENCRYPTION_KEY" --cloud aws ${{ secrets.BACKUP_BUCKET }}
+
+      - name: Upload backup to artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: backup-${{ github.run_number }}
+          path: /backup/helm-proxy/backup_*.tar.gz*
+
+      - name: Notify backup status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Backup completed successfully" | tee -a $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Backup failed" | tee -a $GITHUB_STEP_SUMMARY
+          fi
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

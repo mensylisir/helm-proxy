@@ -1,0 +1,329 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: helm-proxy-system
+  labels:
+    name: helm-proxy-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: helm-proxy-sa
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+    version: v1.0.0
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: helm-proxy-admin-binding
+  labels:
+    app: helm-proxy
+subjects:
+- kind: ServiceAccount
+  name: helm-proxy-sa
+  namespace: helm-proxy-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: helm-proxy-credentials
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+type: Opaque
+stringData:
+  jwt-secret: "CHANGE_ME_TO_256_BIT_SECRET_KEY_IN_PRODUCTION_OFFLINE"
+  helm-username: "admin"
+  helm-password: "Def@u1tpwd"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helm-proxy-config
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+data:
+  config.yaml: |
+    server:
+      port: "8443"
+    helm:
+      driver: "secret"
+      repos:
+        myrepo: "http://registry.dev.rdev.tech:18091/repository/helm"
+    security:
+      auth:
+        enabled: true
+        jwtSecret: "CHANGE_ME_TO_256_BIT_SECRET_KEY_IN_PRODUCTION_OFFLINE"
+      rateLimit:
+        enabled: true
+        rate: 200
+        burst: 400
+    monitoring:
+      metricsEnabled: true
+      logLevel: "warn"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helm-proxy
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+    version: v1.0.0
+spec:
+  replicas: 3  # 高可用：3个副本
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: helm-proxy
+  template:
+    metadata:
+      labels:
+        app: helm-proxy
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8443"
+        prometheus.io/path: "/v1/monitor/metrics"
+    spec:
+      serviceAccountName: helm-proxy-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      # Init 容器：初始化内部 Helm 仓库
+      initContainers:
+      - name: init-repo
+        image: registry.dev.rdev.tech:18091/library/alpine:3.18
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Initializing internal Helm repositories..."
+            # 仅配置内部仓库
+            helm repo add myrepo http://registry.dev.rdev.tech:18091/repository/helm --force-update 2>/dev/null || true
+            helm repo update 2>/dev/null || true
+            echo "Internal Helm repositories initialized"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      containers:
+      - name: helm-proxy
+        image: registry.dev.rdev.tech:18091/helm-proxy:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8443
+          name: http
+          protocol: TCP
+        env:
+        # 基础配置
+        - name: PORT
+          value: "8443"
+        - name: GIN_MODE
+          value: "release"
+        - name: LOG_LEVEL
+          value: "warn"
+        # 从 Secret 读取敏感信息
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: helm-proxy-credentials
+              key: jwt-secret
+        - name: HELM_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: helm-proxy-credentials
+              key: helm-username
+        - name: HELM_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: helm-proxy-credentials
+              key: helm-password
+        # Helm 配置 - 仅内部仓库
+        - name: HELM_REPOS
+          value: "myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+        - name: HELM_DRIVER
+          value: "secret"
+        - name: HELM_CACHE_DIR
+          value: "/data/helm-cache"
+        - name: HELM_CONFIG_DIR
+          value: "/data/helm-config"
+        # 安全配置
+        - name: AUTH_ENABLED
+          value: "true"
+        - name: RATE_LIMIT_ENABLED
+          value: "true"
+        - name: RATE_LIMIT_RATE
+          value: "200"
+        - name: RATE_LIMIT_BURST
+          value: "400"
+        # 生产环境配置
+        - name: MAX_CONCURRENT_DEPLOYS
+          value: "20"
+        - name: REQUIRE_STRONG_PASSWORD
+          value: "true"
+        - name: VALIDATE_NODEPORT
+          value: "true"
+        - name: METRICS_ENABLED
+          value: "true"
+        # 离线环境配置
+        - name: OFFLINE_MODE
+          value: "true"
+        - name: INTERNAL_REGISTRY_ONLY
+          value: "true"
+        # 资源限制
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        # 健康检查
+        livenessProbe:
+          httpGet:
+            path: /v1/monitor/health
+            port: 8443
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /v1/monitor/health
+            port: 8443
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /v1/monitor/health
+            port: 8443
+          failureThreshold: 30
+          periodSeconds: 10
+          initialDelaySeconds: 10
+        # 安全上下文
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        # 卷挂载
+        volumeMounts:
+        - name: helm-data
+          mountPath: /data
+        - name: helm-cache
+          mountPath: /root/.cache/helm
+        - name: helm-config
+          mountPath: /root/.config/helm
+        - name: tmp
+          mountPath: /tmp
+      # 数据卷
+      volumes:
+      - name: helm-data
+        emptyDir: {}
+      - name: helm-cache
+        emptyDir: {}
+      - name: helm-config
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      # 节点选择器
+      nodeSelector:
+        kubernetes.io/os: linux
+      # 容忍
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: helm-proxy
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+spec:
+  type: LoadBalancer
+  selector:
+    app: helm-proxy
+  ports:
+  - name: http
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: helm-proxy-hpa
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: helm-proxy
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: helm-proxy-pdb
+  namespace: helm-proxy-system
+  labels:
+    app: helm-proxy
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: helm-proxy

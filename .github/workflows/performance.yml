@@ -1,0 +1,115 @@
+name: Performance Tests
+
+on:
+  schedule:
+    # 每天凌晨1点执行
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Test duration in seconds'
+        required: false
+        default: '300'
+      concurrent_users:
+        description: 'Number of concurrent users'
+        required: false
+        default: '10'
+
+jobs:
+  performance-test:
+    name: Performance Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          go build -o helm-proxy ./main.go
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_TEST }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Start test environment
+        run: |
+          export HELM_REPOS="myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+          export HELM_USERNAME=${{ secrets.HELM_USERNAME }}
+          export HELM_PASSWORD=${{ secrets.HELM_PASSWORD }}
+          ./deploy-production.sh deploy
+
+      - name: Run performance tests
+        run: |
+          export SERVICE_URL=http://localhost:8443
+          export TEST_DURATION=${{ github.event.inputs.duration || '300' }}
+          export CONCURRENT_USERS=${{ github.event.inputs.concurrent_users || '10' }}
+          ./performance-test.sh full
+
+      - name: Upload performance test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-test-results-${{ github.run_number }}
+          path: /tmp/helm-proxy-performance-test/
+
+      - name: Generate performance report
+        run: |
+          ./performance-test.sh report
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-report-${{ github.run_number }}
+          path: /tmp/helm-proxy-performance-test/*.html
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const resultsDir = '/tmp/helm-proxy-performance-test';
+
+            if (fs.existsSync(resultsDir)) {
+              const reportFiles = fs.readdirSync(resultsDir).filter(f => f.endsWith('.html'));
+              if (reportFiles.length > 0) {
+                const reportPath = path.join(resultsDir, reportFiles[0]);
+                const reportContent = fs.readFileSync(reportPath, 'utf8');
+
+                github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: '## Performance Test Results\n\nPerformance test completed. View the detailed report in the artifacts.'
+                });
+              }
+            }
+
+      - name: Notify performance test status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Performance test completed" | tee -a $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Performance test failed" | tee -a $GITHUB_STEP_SUMMARY
+          fi
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          export KUBECONFIG=kubeconfig
+          ./deploy-production.sh cleanup

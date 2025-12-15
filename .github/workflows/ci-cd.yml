@@ -1,0 +1,327 @@
+name: Helm Proxy CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 代码质量检查
+  lint:
+    name: Lint and Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.54.2
+
+      - name: Run linter
+        run: |
+          golangci-lint run -v
+        env:
+          GOLANGCI_LINT_VERSION: v1.54.2
+
+      - name: Check formatting
+        run: |
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "Code is not formatted"
+            gofmt -s -l .
+            exit 1
+          fi
+
+      - name: Check imports
+        run: |
+          go mod tidy
+          git diff --exit-code
+
+  # 单元测试
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Run tests
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  # 构建镜像
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image digest
+        id: image
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # 安全扫描
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # 性能测试
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          go build -o helm-proxy ./main.go
+
+      - name: Start service
+        run: |
+          ./helm-proxy --port 8443 &
+          sleep 10
+
+      - name: Run performance tests
+        run: |
+          ./performance-test.sh full
+
+      - name: Upload performance test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-test-results
+          path: /tmp/helm-proxy-performance-test/
+
+  # Kubernetes 部署测试
+  deploy-test:
+    name: Kubernetes Deploy Test
+    runs-on: ubuntu-latest
+    needs: [build, security]
+    environment: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_TEST }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to test environment
+        run: |
+          export HELM_REPOS="myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+          export HELM_USERNAME=${{ secrets.HELM_USERNAME }}
+          export HELM_PASSWORD=${{ secrets.HELM_PASSWORD }}
+          ./deploy-production.sh deploy
+
+      - name: Run health check
+        run: |
+          sleep 30
+          curl -f http://localhost:8443/v1/monitor/health
+
+      - name: Run backup test
+        run: |
+          ./backup-restore.sh health
+
+      - name: Cleanup
+        if: always()
+        run: |
+          export KUBECONFIG=kubeconfig
+          ./deploy-production.sh cleanup
+
+  # 安全扫描
+  k8s-security:
+    name: Kubernetes Security Scan
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_TEST }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Run security scan
+        run: |
+          ./security-scan.sh full
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: /tmp/helm-proxy-security-scan/
+
+  # 发布到生产环境
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-test, k8s-security]
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to production
+        run: |
+          export HELM_REPOS="myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+          export HELM_USERNAME=${{ secrets.HELM_USERNAME }}
+          export HELM_PASSWORD=${{ secrets.HELM_PASSWORD }}
+          export JWT_SECRET=${{ secrets.JWT_SECRET }}
+          ./deploy-production.sh deploy
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/helm-proxy -n helm-proxy-system --timeout=600s
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          curl -f http://localhost:8443/v1/monitor/health
+          ./backup-restore.sh health
+
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!" | tee -a $GITHUB_STEP_SUMMARY
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Production deployment failed!" | tee -a $GITHUB_STEP_SUMMARY
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+  # 创建发布
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o helm-proxy-linux-amd64 ./main.go
+          GOOS=darwin GOARCH=amd64 go build -o helm-proxy-darwin-amd64 ./main.go
+          GOOS=windows GOARCH=amd64 go build -o helm-proxy-windows-amd64.exe ./main.go
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            helm-proxy-linux-amd64
+            helm-proxy-darwin-amd64
+            helm-proxy-windows-amd64.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

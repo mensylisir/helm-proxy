@@ -652,6 +652,37 @@ func (m *HelmManager) parseValues(answers map[string]string, valuesYaml string) 
 			return nil, err
 		}
 	}
+	// 智能推断：设置了 nodePort 但没设置 type，自动设置为 NodePort
+	hasNodePort := false
+	hasServiceType := false
+
+	// 检查 answers 中是否包含相关键
+	for k := range answers {
+		if k == "service.nodePort" {
+			hasNodePort = true
+		}
+		if k == "service.type" {
+			hasServiceType = true
+		}
+	}
+
+	// 检查 base (valuesYaml) 中是否已有相关配置
+	if serviceMap, ok := base["service"].(map[string]interface{}); ok {
+		if _, exists := serviceMap["nodePort"]; exists {
+			hasNodePort = true
+		}
+		if _, exists := serviceMap["type"]; exists {
+			hasServiceType = true
+		}
+	}
+
+	// 自动推断
+	if hasNodePort && !hasServiceType {
+		if err := strvals.ParseInto("service.type=NodePort", base); err != nil {
+			return nil, err
+		}
+		m.logger.Debug("Auto-inferred service.type=NodePort based on nodePort setting")
+	}
 
 	// 2. 处理 Answers (点分键值对)
 	for k, v := range answers {

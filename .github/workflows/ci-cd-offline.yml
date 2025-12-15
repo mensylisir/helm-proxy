@@ -1,0 +1,249 @@
+name: Helm Proxy CI/CD (Offline)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: registry.dev.rdev.tech:18091
+  IMAGE_NAME: helm-proxy
+
+jobs:
+  # 代码质量检查
+  lint:
+    name: Lint and Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.54.2
+
+      - name: Run linter
+        run: |
+          golangci-lint run -v
+        env:
+          GOLANGCI_LINT_VERSION: v1.54.2
+
+      - name: Check formatting
+        run: |
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "Code is not formatted"
+            gofmt -s -l .
+            exit 1
+          fi
+
+      - name: Check imports
+        run: |
+          go mod tidy
+          git diff --exit-code
+
+  # 单元测试
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Run tests
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage
+          path: coverage.out
+
+  # 构建镜像（使用内部镜像仓库）
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Internal Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.INTERNAL_REGISTRY_USER }}
+          password: ${{ secrets.INTERNAL_REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image digest
+        id: image
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # Kubernetes 部署测试（离线环境）
+  deploy-test:
+    name: Kubernetes Deploy Test (Offline)
+    runs-on: ubuntu-latest
+    needs: build
+    environment: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_TEST }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to test environment (offline)
+        run: |
+          export HELM_REPOS="myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+          export HELM_USERNAME=${{ secrets.INTERNAL_REGISTRY_USER }}
+          export HELM_PASSWORD=${{ secrets.INTERNAL_REGISTRY_PASSWORD }}
+          export JWT_SECRET=${{ secrets.JWT_SECRET }}
+          ./deploy/scripts/deploy-production.sh deploy
+
+      - name: Run health check
+        run: |
+          sleep 30
+          curl -f http://localhost:8443/v1/monitor/health
+
+      - name: Run backup test
+        run: |
+          ./deploy/scripts/backup-restore.sh health
+
+      - name: Run performance tests (offline)
+        run: |
+          ./deploy/scripts/performance-test.sh health
+          ./deploy/scripts/performance-test.sh api
+
+      - name: Cleanup
+        if: always()
+        run: |
+          export KUBECONFIG=kubeconfig
+          ./deploy/scripts/deploy-production.sh cleanup
+
+  # 安全扫描（离线模式）
+  security:
+    name: Security Scan (Offline)
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_TEST }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Run security scan (offline)
+        run: |
+          ./deploy/scripts/security-scan.sh init
+          ./deploy/scripts/security-scan.sh rbac
+          ./deploy/scripts/security-scan.sh secrets
+          ./deploy/scripts/security-scan.sh resources
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: /tmp/helm-proxy-security-scan/
+
+  # 发布到生产环境（离线）
+  deploy-prod:
+    name: Deploy to Production (Offline)
+    runs-on: ubuntu-latest
+    needs: [deploy-test, security]
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Set up kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to production (offline)
+        run: |
+          export HELM_REPOS="myrepo=http://registry.dev.rdev.tech:18091/repository/helm"
+          export HELM_USERNAME=${{ secrets.INTERNAL_REGISTRY_USER }}
+          export HELM_PASSWORD=${{ secrets.INTERNAL_REGISTRY_PASSWORD }}
+          export JWT_SECRET=${{ secrets.JWT_SECRET }}
+          ./deploy/scripts/deploy-production.sh deploy
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/helm-proxy -n helm-proxy-system --timeout=600s
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          curl -f http://localhost:8443/v1/monitor/health
+          ./deploy/scripts/backup-restore.sh health
+
+      - name: Create backup
+        run: |
+          ./deploy/scripts/backup-restore.sh backup --namespace helm-proxy-system
+
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "✅ Production deployment successful (offline mode)!" | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Production deployment failed (offline mode)!" | tee -a $GITHUB_STEP_SUMMARY
