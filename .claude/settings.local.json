@@ -52,7 +52,10 @@
       "Bash(find:*)",
       "Bash(tree:*)",
       "Bash(lsof:*)",
-      "Bash(openssl:*)"
+      "Bash(openssl:*)",
+      "Bash(go get:*)",
+      "Bash(go mod:*)",
+      "Bash(go test ./core -v:*)"
     ]
   }
 }

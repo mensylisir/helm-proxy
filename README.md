@@ -47,7 +47,7 @@ stringData:
 stringData:
   jwt-secret: "qI1ovofr7dPaAsWZc93V8AxthAa2P1WyJ20lr9vkLFo="  # 你的 JWT 密钥
   helm-username: "admin"           # 你的用户名
-  helm-password: "Def@u1tpwd"      # 你的密码
+  helm-password: "xxxxxxx"      # 你的密码
 ```
 
 **如果使用无密码仓库**，可以删除或不设置 `helm-username` 和 `helm-password` 字段。
@@ -89,6 +89,7 @@ curl -X POST http://$SERVICE_IP:8443/v3/projects/default:p-test/app \
 ```
 
 **预期响应**：
+
 ```json
 {
   "data": {

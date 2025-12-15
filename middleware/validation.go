@@ -458,11 +458,18 @@ func ErrorHandlingMiddleware() gin.HandlerFunc {
 }
 
 // HandleSuccess 处理成功响应
-func HandleSuccess(c *gin.Context, data interface{}) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    data,
-	})
+// bypassWrapper: 是否绕过包装层，直接返回数据（用于 Rancher API 兼容性）
+func HandleSuccess(c *gin.Context, data interface{}, bypassWrapper ...bool) {
+	if len(bypassWrapper) > 0 && bypassWrapper[0] {
+		// 绕过包装，直接返回数据（Rancher API 格式）
+		c.JSON(http.StatusOK, data)
+	} else {
+		// 标准包装格式
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data":    data,
+		})
+	}
 }
 
 // HandlePaginatedSuccess 处理分页成功响应

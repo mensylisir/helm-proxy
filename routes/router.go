@@ -61,7 +61,10 @@ func (r *Router) SetupRoutes() {
 	// Metrics端点（不需要验证）
 	metricsGroup := r.engine.Group("/metrics")
 	{
-		metricsGroup.GET("", middleware.MetricsHandler())
+		// Prometheus 格式的指标端点
+		metricsGroup.GET("", middleware.PrometheusMetricsHandler())
+		// 自定义指标端点（JSON格式）
+		metricsGroup.GET("/custom", middleware.MetricsHandler())
 	}
 
 	// Rancher兼容API路由组（需要输入验证）
@@ -99,13 +102,16 @@ func (r *Router) setupRancherRoutes(group *gin.RouterGroup) {
 		{
 			// 部署应用（POST /v3/projects/:projectId/app）
 			appGroup.POST("", r.deployApp)
-			
+
 			// 查询应用状态（GET /v3/projects/:projectId/app/:name）
 			appGroup.GET("/:name", r.getAppStatus)
-			
+
 			// 应用列表（GET /v3/projects/:projectId/apps）
 			appGroup.GET("", r.listApps)
-			
+
+			// 删除应用（DELETE /v3/projects/:projectId/app/:name）
+			appGroup.DELETE("/:name", r.deleteAppRancher)
+
 			// 应用操作（POST /v3/projects/:projectId/apps/:name）
 			appGroup.POST("/:name", r.operateApp)
 		}
@@ -268,7 +274,7 @@ func (r *Router) deployApp(c *gin.Context) {
 		return
 	}
 
-	middleware.HandleSuccess(c, resp)
+	middleware.HandleSuccess(c, resp, true)
 }
 
 // getAppStatus 获取应用状态（Rancher兼容）
@@ -288,7 +294,7 @@ func (r *Router) getAppStatus(c *gin.Context) {
 	}
 
 	_ = projectID // 项目ID已在状态查询中使用
-	middleware.HandleSuccess(c, status)
+	middleware.HandleSuccess(c, status, true)
 }
 
 // listApps 列出应用（Rancher兼容）
@@ -320,17 +326,110 @@ func (r *Router) listApps(c *gin.Context) {
 	middleware.HandlePaginatedSuccess(c, apps, 0, 1, 10)
 }
 
+// deleteAppRancher 删除应用（Rancher兼容）
+func (r *Router) deleteAppRancher(c *gin.Context) {
+	name := c.Param("name")
+	projectID := c.Param("projectId")
+	targetNamespace := c.Query("targetNamespace")
+
+	if targetNamespace == "" {
+		targetNamespace = "default"
+	}
+
+	// 调用Helm管理器进行卸载
+	err := r.manager.UninstallApp(targetNamespace, name)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Deletion failed", err.Error())
+		return
+	}
+
+	appID := fmt.Sprintf("%s:%s", projectID, name)
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"id":      appID,
+		"state":   "removing",
+		"name":    name,
+		"message": "Application deletion initiated",
+	}, true)
+}
+
 // operateApp 应用操作（Rancher兼容）
 func (r *Router) operateApp(c *gin.Context) {
 	name := c.Param("name")
+	projectID := c.Param("projectId")
 	action := c.Query("action")
+	targetNamespace := c.Query("targetNamespace")
 
-	_ = name // 应用名称已在操作中使用
+	if targetNamespace == "" {
+		targetNamespace = "default"
+	}
+
 	switch action {
 	case "upgrade":
-		middleware.HandleSuccess(c, map[string]string{"status": "upgrade-initiated"})
+		// 从请求体中获取新的值
+		var req model.RancherRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
+			return
+		}
+
+		// 解析 values
+		vals, err := r.manager.ParseValues(req.Answers, req.ValuesYaml)
+		if err != nil {
+			middleware.HandleBadRequest(c, "Invalid values", err.Error())
+			return
+		}
+
+		// 执行升级
+		rel, err := r.manager.UpgradeApp(targetNamespace, name, "", vals)
+		if err != nil {
+			middleware.HandleInternalServerError(c, "Upgrade failed", err.Error())
+			return
+		}
+
+		// 构建响应
+		rancherReq := model.RancherRequest{
+			Name:            name,
+			TargetNamespace: targetNamespace,
+			ExternalID:      req.ExternalID,
+			ProjectID:       projectID,
+			Answers:         req.Answers,
+			ValuesYaml:      req.ValuesYaml,
+			Prune:           req.Prune,
+			Timeout:         req.Timeout,
+			Wait:            req.Wait,
+		}
+		resp := r.manager.BuildResponse(rel, rancherReq)
+		middleware.HandleSuccess(c, resp, true)
+
 	case "rollback":
-		middleware.HandleSuccess(c, map[string]string{"status": "rollback-initiated"})
+		// 从请求体中获取 revision
+		var req map[string]interface{}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
+			return
+		}
+
+		revision := 0
+		if rev, ok := req["revision"].(float64); ok {
+			revision = int(rev)
+		}
+
+		// 执行回滚
+		rel, err := r.manager.RollbackApp(targetNamespace, name, revision)
+		if err != nil {
+			middleware.HandleInternalServerError(c, "Rollback failed", err.Error())
+			return
+		}
+
+		// 构建响应
+		rancherReq := model.RancherRequest{
+			Name:            name,
+			TargetNamespace: targetNamespace,
+			ProjectID:       projectID,
+		}
+		resp := r.manager.BuildResponse(rel, rancherReq)
+		middleware.HandleSuccess(c, resp, true)
+
 	default:
 		middleware.HandleBadRequest(c, "Unsupported action", "Action must be 'upgrade' or 'rollback'")
 	}

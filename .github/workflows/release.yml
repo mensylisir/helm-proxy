@@ -1,0 +1,98 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 推送版本标签时触发，如 v1.0.0
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，用于生成 changelog
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build binaries for multiple platforms
+        run: |
+          # Linux AMD64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o helm-proxy-linux-amd64 ./main.go
+          # macOS AMD64
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o helm-proxy-darwin-amd64 ./main.go
+          # macOS ARM64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o helm-proxy-darwin-arm64 ./main.go
+          # Windows AMD64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o helm-proxy-windows-amd64.exe ./main.go
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum helm-proxy-linux-amd64 > helm-proxy-linux-amd64.sha256
+          sha256sum helm-proxy-darwin-amd64 > helm-proxy-darwin-amd64.sha256
+          sha256sum helm-proxy-darwin-arm64 > helm-proxy-darwin-arm64.sha256
+          sha256sum helm-proxy-windows-amd64.exe > helm-proxy-windows-amd64.exe.sha256
+
+      - name: Create dist directory
+        run: mkdir -p dist
+
+      - name: Move files to dist
+        run: |
+          mv helm-proxy-* dist/
+          mv README.md dist/  # 添加 README 到 release
+          mv deploy/ dist/    # 添加部署脚本
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 获取上一个标签
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "## Changes" > CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" HEAD >> CHANGELOG.md
+          else
+            echo "## Changes since $PREVIOUS_TAG" > CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" ${PREVIOUS_TAG}..HEAD >> CHANGELOG.md
+          fi
+          echo "" >> CHANGELOG.md
+          echo "Full changelog: https://github.com/${{ github.repository }}/compare/$PREVIOUS_TAG...${{ github.ref_name }}" >> CHANGELOG.md
+          cat CHANGELOG.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release v${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          files: |
+            dist/helm-proxy-linux-amd64
+            dist/helm-proxy-linux-amd64.sha256
+            dist/helm-proxy-darwin-amd64
+            dist/helm-proxy-darwin-amd64.sha256
+            dist/helm-proxy-darwin-arm64
+            dist/helm-proxy-darwin-arm64.sha256
+            dist/helm-proxy-windows-amd64.exe
+            dist/helm-proxy-windows-amd64.exe.sha256
+            dist/README.md
+            dist/deploy/
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets
+        run: |
+          echo "✅ Release created successfully!"
+          echo "Download from: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"

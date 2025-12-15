@@ -1,11 +1,18 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +30,9 @@ type Config struct {
 
 	// 监控配置
 	Monitoring MonitoringConfig `yaml:"monitoring"`
+
+	// 链路追踪配置
+	Tracing TracingConfig `yaml:"tracing"`
 }
 
 // ServerConfig 服务器配置
@@ -93,6 +103,17 @@ type HealthCheckConfig struct {
 	Path     string `yaml:"path" env:"HEALTH_PATH" default:"/health"`
 	Timeout  int    `yaml:"timeout" env:"HEALTH_TIMEOUT" default:"10"`
 	Interval int    `yaml:"interval" env:"HEALTH_INTERVAL" default:"30"`
+}
+
+// TracingConfig 链路追踪配置
+type TracingConfig struct {
+	Enabled         bool    `yaml:"enabled" env:"TRACING_ENABLED" default:"false"`
+	ServiceName     string  `yaml:"serviceName" env:"TRACING_SERVICE_NAME" default:"helm-proxy"`
+	JaegerEndpoint  string  `yaml:"jaegerEndpoint" env:"JAEGER_ENDPOINT" default:"http://localhost:14268/api/traces"`
+	ZipkinEndpoint  string  `yaml:"zipkinEndpoint" env:"ZIPKIN_ENDPOINT" default:"http://localhost:9411/api/v2/spans"`
+	SampleRate      float64 `yaml:"sampleRate" env:"TRACING_SAMPLE_RATE" default:"0.1"`
+	BufferSize      int     `yaml:"bufferSize" env:"TRACING_BUFFER_SIZE" default:"1000"`
+	Batcher         string  `yaml:"batcher" env:"TRACING_BATCHER" default:"jaeger"`
 }
 
 // Load 加载配置
@@ -177,12 +198,22 @@ func LoadWithOptions(configFile, port, logLevel string) (*Config, error) {
 		cfg.Monitoring.LogLevel = logLevel
 	}
 
-	// 3. 验证配置
+	// 3. 从 Kubernetes Secret 加载敏感配置（如果可用）
+	if err := loadFromKubernetesSecret(cfg); err != nil {
+		// 只有在非开发环境下才返回错误
+		if os.Getenv("ENVIRONMENT") != "development" {
+			return nil, fmt.Errorf("failed to load from Kubernetes Secret: %w", err)
+		}
+		// 开发环境下记录警告但不阻止启动
+		fmt.Printf("[WARN] Failed to load from Kubernetes Secret: %v\n", err)
+	}
+
+	// 4. 验证配置
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
-	// 4. 初始化 Helm 仓库配置（向后兼容）
+	// 5. 初始化 Helm 仓库配置（向后兼容）
 	initializeHelmRepos(cfg)
 
 	return cfg, nil
@@ -203,6 +234,81 @@ func loadFromFile(filename string, cfg *Config) error {
 	}
 
 	return yaml.Unmarshal(data, cfg)
+}
+
+// loadFromKubernetesSecret 从 Kubernetes Secret 加载敏感配置
+func loadFromKubernetesSecret(cfg *Config) error {
+	// 获取命名空间（默认：helm-proxy-system）
+	namespace := os.Getenv("HELM_PROXY_NAMESPACE")
+	if namespace == "" {
+		namespace = "helm-proxy-system"
+	}
+
+	// Secret 名称（默认：helm-proxy-credentials）
+	secretName := os.Getenv("HELM_PROXY_SECRET_NAME")
+	if secretName == "" {
+		secretName = "helm-proxy-credentials"
+	}
+
+	// 获取 Kubernetes 配置
+	config, err := getKubernetesConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get Kubernetes config: %w", err)
+	}
+
+	// 创建客户端
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	// 设置超时
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 获取 Secret
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get Secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	// 从 Secret 中读取配置
+	if jwtSecret, ok := secret.Data["jwt-secret"]; ok && len(jwtSecret) > 0 {
+		cfg.Security.Auth.JWTSecret = string(jwtSecret)
+		cfg.Security.Auth.Enabled = true
+	}
+
+	if helmUsername, ok := secret.Data["helm-username"]; ok && len(helmUsername) > 0 {
+		os.Setenv("HELM_USERNAME", string(helmUsername))
+	}
+
+	if helmPassword, ok := secret.Data["helm-password"]; ok && len(helmPassword) > 0 {
+		os.Setenv("HELM_PASSWORD", string(helmPassword))
+	}
+
+	return nil
+}
+
+// getKubernetesConfig 获取 Kubernetes 配置
+func getKubernetesConfig() (*rest.Config, error) {
+	// 尝试 InCluster 配置
+	config, err := rest.InClusterConfig()
+	if err == nil {
+		return config, nil
+	}
+
+	// 回退到 kubeconfig
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
+	}
+
+	config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build Kubernetes config: %w", err)
+	}
+
+	return config, nil
 }
 
 // Validate 验证配置

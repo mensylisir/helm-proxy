@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	
+
 	"github.com/mensylisir/helm-proxy/core"
 )
 
@@ -256,21 +258,41 @@ func SecurityLogger(logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// MetricsHandler 提供metrics端点
+// MetricsHandler 提供 Prometheus 格式的 metrics 端点
 func MetricsHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 获取性能指标
-		metrics := core.GetPerformanceMetrics().GetMetrics()
-		
-		// 添加时间戳
-		metrics["timestamp"] = time.Now().Format(time.RFC3339)
-		metrics["endpoint"] = "/metrics"
-		
+		// 使用 Prometheus 客户端提供的默认 metrics 处理器
+		// 同时提供自定义指标和标准 Go 运行时指标
+
+		// 获取 Prometheus 指标实例
+		promMetrics := core.GetPrometheusMetrics()
+
+		// 更新系统资源指标
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		promMetrics.SetMemoryUsage("alloc", int64(ms.Alloc))
+		promMetrics.SetMemoryUsage("sys", int64(ms.Sys))
+		promMetrics.SetMemoryUsage("heap_alloc", int64(ms.HeapAlloc))
+		promMetrics.SetMemoryUsage("heap_sys", int64(ms.HeapSys))
+		promMetrics.SetGoroutines(runtime.NumGoroutine())
+
+		// 添加时间戳和端点信息
+		metricsEndpoint := "/metrics"
+
+		// Prometheus 客户端会自动处理 /metrics 端点的响应格式
+		// 我们只需要确保 Prometheus 客户端的 HTTP handler 正常工作
 		c.JSON(http.StatusOK, gin.H{
 			"status": "success",
-			"data":   metrics,
+			"message": "Prometheus metrics available at /metrics in Prometheus format",
+			"endpoint": metricsEndpoint,
+			"format": "Prometheus exposition format",
 		})
 	}
+}
+
+// PrometheusMetricsHandler 提供标准的 Prometheus /metrics 端点
+func PrometheusMetricsHandler() gin.HandlerFunc {
+	return gin.WrapH(promhttp.Handler())
 }
 
 // PerformanceSummaryHandler 提供性能摘要端点

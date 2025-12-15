@@ -17,8 +17,10 @@ import (
 	"helm.sh/helm/v3/pkg/strvals"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 
+	"github.com/google/uuid"
 	"github.com/mensylisir/helm-proxy/config"
 	"github.com/mensylisir/helm-proxy/model"
+	"gopkg.in/yaml.v3"
 )
 
 // DeploymentJob 部署作业结构体
@@ -96,6 +98,7 @@ func (m *HelmManager) handleAsyncDeployment(req *model.RancherRequest, doDeploy 
 		Answers:              req.Answers,
 		Created:              time.Now().Format(time.RFC3339),
 		CreatedTS:            time.Now().UnixMilli(),
+		UUID:                 uuid.New().String(),
 		Labels:               map[string]string{"cattle.io/creator": "norman"},
 		Annotations:          map[string]string{},
 		Transitioning:        "yes",
@@ -105,14 +108,14 @@ func (m *HelmManager) handleAsyncDeployment(req *model.RancherRequest, doDeploy 
 		NamespaceID:          "",
 		CreatorID:            "user-helm-proxy",
 		Links: map[string]string{
-			"self":     fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"update":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"remove":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"revision": fmt.Sprintf("/v3/project/%s/apps/%s/revision", projectID, appID),
+			"self":     fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"update":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"remove":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"revision": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s/revision", projectID, appID),
 		},
 		ActionLinks: map[string]string{
-			"upgrade":  fmt.Sprintf("/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
-			"rollback": fmt.Sprintf("/v3/project/%s/apps/%s?action=rollback", projectID, appID),
+			"upgrade":  fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
+			"rollback": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=rollback", projectID, appID),
 		},
 	}, nil
 }
@@ -224,8 +227,8 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *HelmManager {
 	prodConfig := config.DefaultProductionConfig()
 	validator := NewProductionValidator(prodConfig, logger)
 
-	// 创建Chart缓存（最大100个条目，TTL 1小时）
-	chartCache := NewChartCache(100, time.Hour)
+	// 创建Chart缓存（最大500个条目，TTL 2小时）
+	chartCache := NewChartCache(500, 2*time.Hour)
 
 	return &HelmManager{
 		cfg:                 cfg,
@@ -247,8 +250,8 @@ func NewManagerWithProduction(cfg *config.Config, prodConfig *config.ProductionC
 		validator = NewProductionValidator(prodConfig, logger)
 	}
 
-	// 创建Chart缓存（最大100个条目，TTL 1小时）
-	chartCache := NewChartCache(100, time.Hour)
+	// 创建Chart缓存（最大500个条目，TTL 2小时）
+	chartCache := NewChartCache(500, 2*time.Hour)
 
 	return &HelmManager{
 		cfg:                 cfg,
@@ -263,10 +266,21 @@ func NewManagerWithProduction(cfg *config.Config, prodConfig *config.ProductionC
 
 // PrepareAndExecute 负责解析参数、加锁、决定同步还是异步
 func (m *HelmManager) PrepareAndExecute(req model.RancherRequest) (*model.RancherResponse, error) {
+	startTime := time.Now()
+
+	// 获取 Prometheus 指标实例
+	promMetrics := GetPrometheusMetrics()
+
+	// 记录 Helm 操作开始
+	promMetrics.RecordHelmOperationStart("deployment")
+
 	// 1. 生产环境验证（如果启用）
 	if m.productionValidator != nil {
 		if err := m.productionValidator.ValidateRancherRequest(&req); err != nil {
 			m.logger.Error("Production validation failed", zap.Error(err))
+			// 记录验证失败
+			promMetrics.RecordHelmFailure("deployment", "validation_failed")
+			promMetrics.RecordHelmOperationEnd("deployment")
 			return nil, fmt.Errorf("validation failed: %v", err)
 		}
 	}
@@ -285,12 +299,19 @@ func (m *HelmManager) PrepareAndExecute(req model.RancherRequest) (*model.Ranche
 	// 3. 解析 ExternalID (catalog://...)
 	chartURL, version, err := m.resolveChart(req.ExternalID)
 	if err != nil {
+		promMetrics.RecordHelmFailure("deployment", "invalid_external_id")
+		promMetrics.RecordHelmOperationEnd("deployment")
 		return nil, fmt.Errorf("invalid externalId: %v", err)
 	}
 
+	// 提取 Chart 名称用于指标
+	chartName := m.extractChartName(req.ExternalID)
+
 	// 4. 处理参数 (Answers -> Map)
-	vals, err := m.parseValues(req.Answers, req.ValuesYaml)
+	vals, err := m.ParseValues(req.Answers, req.ValuesYaml)
 	if err != nil {
+		promMetrics.RecordHelmFailure("deployment", "parse_values_failed")
+		promMetrics.RecordHelmOperationEnd("deployment")
 		return nil, fmt.Errorf("failed to parse answers: %v", err)
 	}
 
@@ -339,16 +360,36 @@ func (m *HelmManager) PrepareAndExecute(req model.RancherRequest) (*model.Ranche
 	}
 
 	// 5. 执行模式：同步或异步
+	var resp *model.RancherResponse
 	if req.Wait {
 		// 同步：直接执行
 		rel, err := doDeploy(context.Background())
 		if err != nil {
+			duration := time.Since(startTime)
+			promMetrics.RecordDeploymentFailure(req.TargetNamespace, chartName, err.Error())
+			promMetrics.RecordHelmOperation("deployment", "failed", duration)
+			promMetrics.RecordHelmOperationEnd("deployment")
 			return nil, err
 		}
-		return m.buildResponse(rel, req), nil
+		resp = m.BuildResponse(rel, req)
+		duration := time.Since(startTime)
+		promMetrics.RecordDeployment(req.TargetNamespace, chartName, "active", duration)
+		promMetrics.RecordHelmOperation("deployment", "success", duration)
+		promMetrics.RecordHelmOperationEnd("deployment")
+		return resp, nil
 	} else {
 		// 异步：使用 Job Queue 处理，立即返回 Active/Installing 状态
-		return m.handleAsyncDeployment(&req, doDeploy)
+		resp, err = m.handleAsyncDeployment(&req, doDeploy)
+		duration := time.Since(startTime)
+		if err != nil {
+			promMetrics.RecordDeploymentFailure(req.TargetNamespace, chartName, err.Error())
+			promMetrics.RecordHelmOperation("deployment", "failed", duration)
+		} else {
+			promMetrics.RecordDeployment(req.TargetNamespace, chartName, resp.State, duration)
+			promMetrics.RecordHelmOperation("deployment", "success", duration)
+		}
+		promMetrics.RecordHelmOperationEnd("deployment")
+		return resp, err
 	}
 }
 
@@ -396,20 +437,21 @@ func (m *HelmManager) GetAppStatus(namespace, name string) (*model.RancherRespon
 		ProjectID:            projectID,
 		Created:              rel.Info.FirstDeployed.Format(time.RFC3339),
 		CreatedTS:            rel.Info.FirstDeployed.UnixMilli(),
+		UUID:                 uuid.New().String(),
 		Labels:               map[string]string{"cattle.io/creator": "norman"},
 		Annotations:          map[string]string{},
 		Transitioning:        transitioning,
 		TransitioningMessage: transitioningMessage,
 		CreatorID:            "user-helm-proxy",
 		Links: map[string]string{
-			"self":     fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"update":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"remove":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"revision": fmt.Sprintf("/v3/project/%s/apps/%s/revision", projectID, appID),
+			"self":     fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"update":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"remove":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"revision": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s/revision", projectID, appID),
 		},
 		ActionLinks: map[string]string{
-			"upgrade":  fmt.Sprintf("/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
-			"rollback": fmt.Sprintf("/v3/project/%s/apps/%s?action=rollback", projectID, appID),
+			"upgrade":  fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
+			"rollback": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=rollback", projectID, appID),
 		},
 		// 可以添加更多详细信息
 		Prune:   false, // 默认值
@@ -582,6 +624,21 @@ func (m *HelmManager) resolveChart(externalID string) (string, string, error) {
 	return chartRef, version, nil
 }
 
+// extractChartName 从 externalId 中提取 chart 名称（用于指标）
+func (m *HelmManager) extractChartName(externalID string) string {
+	cleanID := strings.Replace(externalID, "catalog://", "http://dummy", 1)
+	u, err := url.Parse(cleanID)
+	if err != nil {
+		return "unknown"
+	}
+	q := u.Query()
+	template := q.Get("template")
+	if template == "" {
+		return "unknown"
+	}
+	return template
+}
+
 // downloadChart 定位和下载 Chart（带缓存）
 func (m *HelmManager) downloadChart(chartRef, version string, cfg *action.Configuration) (string, error) {
 	// 生成缓存键
@@ -643,13 +700,14 @@ func (m *HelmManager) downloadChart(chartRef, version string, cfg *action.Config
 	return cp, nil
 }
 
-func (m *HelmManager) parseValues(answers map[string]string, valuesYaml string) (map[string]interface{}, error) {
+// ParseValues 解析values参数
+func (m *HelmManager) ParseValues(answers map[string]string, valuesYaml string) (map[string]interface{}, error) {
 	base := map[string]interface{}{}
 
-	// 1. 处理 YAML
+	// 1. 处理 YAML - 使用 yaml.Unmarshal 而不是 strvals.ParseInto
 	if valuesYaml != "" {
-		if err := strvals.ParseInto(valuesYaml, base); err != nil {
-			return nil, err
+		if err := yaml.Unmarshal([]byte(valuesYaml), &base); err != nil {
+			return nil, fmt.Errorf("failed to parse values.yaml: %v", err)
 		}
 	}
 	// 智能推断：设置了 nodePort 但没设置 type，自动设置为 NodePort
@@ -693,7 +751,8 @@ func (m *HelmManager) parseValues(answers map[string]string, valuesYaml string) 
 	return base, nil
 }
 
-func (m *HelmManager) buildResponse(rel *release.Release, req model.RancherRequest) *model.RancherResponse {
+// BuildResponse 构建响应
+func (m *HelmManager) BuildResponse(rel *release.Release, req model.RancherRequest) *model.RancherResponse {
 	projectID := req.ProjectID
 	if projectID == "" {
 		projectID = "default"
@@ -728,6 +787,7 @@ func (m *HelmManager) buildResponse(rel *release.Release, req model.RancherReque
 		Answers:              req.Answers,
 		Created:              time.Now().Format(time.RFC3339),
 		CreatedTS:            createdTS,
+		UUID:                 uuid.New().String(),
 		Labels:               map[string]string{"cattle.io/creator": "norman"},
 		Annotations:          map[string]string{},
 		Transitioning:        transitioning,
@@ -737,14 +797,249 @@ func (m *HelmManager) buildResponse(rel *release.Release, req model.RancherReque
 		NamespaceID:          "",
 		CreatorID:            "user-helm-proxy",
 		Links: map[string]string{
-			"self":     fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"update":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"remove":   fmt.Sprintf("/v3/project/%s/apps/%s", projectID, appID),
-			"revision": fmt.Sprintf("/v3/project/%s/apps/%s/revision", projectID, appID),
+			"self":     fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"update":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"remove":   fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s", projectID, appID),
+			"revision": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s/revision", projectID, appID),
 		},
 		ActionLinks: map[string]string{
-			"upgrade":  fmt.Sprintf("/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
-			"rollback": fmt.Sprintf("/v3/project/%s/apps/%s?action=rollback", projectID, appID),
+			"upgrade":  fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=upgrade", projectID, appID),
+			"rollback": fmt.Sprintf("https://192.168.82.192:8443/v3/project/%s/apps/%s?action=rollback", projectID, appID),
 		},
 	}
+}
+
+// UninstallApp 卸载应用
+func (m *HelmManager) UninstallApp(namespace, name string) error {
+	startTime := time.Now()
+
+	// 获取 Prometheus 指标实例
+	promMetrics := GetPrometheusMetrics()
+
+	// 记录 Helm 操作开始
+	promMetrics.RecordHelmOperationStart("uninstall")
+
+	// 获取锁 (Namespace + Name)
+	lockKey := fmt.Sprintf("%s/%s", namespace, name)
+	muRaw, _ := m.keyLock.LoadOrStore(lockKey, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+
+	// 尝试加锁，避免同一应用并发操作
+	mu.Lock()
+	defer mu.Unlock()
+
+	m.logger.Info("Uninstalling application", zap.String("name", name), zap.String("ns", namespace))
+
+	// 初始化 Helm 配置
+	cfg, err := m.getActionConfig(namespace)
+	if err != nil {
+		promMetrics.RecordHelmFailure("uninstall", "config_failed")
+		promMetrics.RecordHelmOperationEnd("uninstall")
+		return fmt.Errorf("failed to get action config: %v", err)
+	}
+
+	// 创建卸载客户端
+	client := action.NewUninstall(cfg)
+	client.Timeout = time.Duration(m.cfg.Helm.Timeout) * time.Second
+
+	// 执行卸载
+	_, err = client.Run(name)
+	if err != nil {
+		duration := time.Since(startTime)
+		promMetrics.RecordHelmFailure("uninstall", err.Error())
+		promMetrics.RecordHelmOperation("uninstall", "failed", duration)
+		promMetrics.RecordHelmOperationEnd("uninstall")
+		return fmt.Errorf("failed to uninstall release: %v", err)
+	}
+
+	// 记录成功
+	duration := time.Since(startTime)
+	promMetrics.RecordHelmOperation("uninstall", "success", duration)
+	promMetrics.RecordHelmOperationEnd("uninstall")
+
+	m.logger.Info("Application uninstalled successfully", zap.String("name", name), zap.String("ns", namespace), zap.Duration("duration", duration))
+	return nil
+}
+
+// UpgradeApp 升级应用
+func (m *HelmManager) UpgradeApp(namespace, name, version string, values map[string]interface{}) (*release.Release, error) {
+	startTime := time.Now()
+
+	// 获取 Prometheus 指标实例
+	promMetrics := GetPrometheusMetrics()
+
+	// 记录 Helm 操作开始
+	promMetrics.RecordHelmOperationStart("upgrade")
+
+	// 获取锁 (Namespace + Name)
+	lockKey := fmt.Sprintf("%s/%s", namespace, name)
+	muRaw, _ := m.keyLock.LoadOrStore(lockKey, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+
+	// 尝试加锁，避免同一应用并发操作
+	mu.Lock()
+	defer mu.Unlock()
+
+	m.logger.Info("Upgrading application", zap.String("name", name), zap.String("ns", namespace), zap.String("version", version))
+
+	// 初始化 Helm 配置
+	cfg, err := m.getActionConfig(namespace)
+	if err != nil {
+		promMetrics.RecordHelmFailure("upgrade", "config_failed")
+		promMetrics.RecordHelmOperationEnd("upgrade")
+		return nil, fmt.Errorf("failed to get action config: %v", err)
+	}
+
+	// 获取当前 release 信息
+	statusClient := action.NewStatus(cfg)
+	rel, err := statusClient.Run(name)
+	if err != nil {
+		promMetrics.RecordHelmFailure("upgrade", "not_found")
+		promMetrics.RecordHelmOperationEnd("upgrade")
+		return nil, fmt.Errorf("release not found: %v", err)
+	}
+
+	// 解析 ExternalID 获取 chart 信息
+	var externalID string
+	if rel.Chart != nil && rel.Chart.Metadata != nil {
+		// 从 chart metadata 构建 externalId
+		// 这里简化处理，实际应该从存储的 externalId 获取
+		chartName := rel.Chart.Metadata.Name
+		if version == "" {
+			version = rel.Chart.Metadata.Version
+		}
+		// 需要从 repo map 中找到匹配的 catalog 名称
+		// 这里假设使用第一个匹配的仓库
+		var catalogName string
+		for name, url := range m.cfg.Helm.RepoMap {
+			if strings.Contains(url, "repository/helm") || strings.Contains(url, chartName) {
+				catalogName = name
+				break
+			}
+		}
+		if catalogName != "" {
+			externalID = fmt.Sprintf("catalog://?catalog=%s&template=%s&version=%s", catalogName, chartName, version)
+		}
+	}
+
+	// 解析 externalId 获取 chart URL
+	var chartURL string
+	if externalID != "" {
+		chartURL, _, err = m.resolveChart(externalID)
+		if err != nil {
+			promMetrics.RecordHelmFailure("upgrade", "invalid_external_id")
+			promMetrics.RecordHelmOperationEnd("upgrade")
+			return nil, fmt.Errorf("invalid externalId: %v", err)
+		}
+	} else {
+		// 回退：使用当前 chart
+		chartURL = rel.Chart.Name()
+	}
+
+	// 下载 chart
+	cp, err := m.downloadChart(chartURL, version, cfg)
+	if err != nil {
+		promMetrics.RecordHelmFailure("upgrade", "chart_download_failed")
+		promMetrics.RecordHelmOperationEnd("upgrade")
+		return nil, fmt.Errorf("failed to download chart: %v", err)
+	}
+
+	loadedChart, err := loader.Load(cp)
+	if err != nil {
+		promMetrics.RecordHelmFailure("upgrade", "chart_load_failed")
+		promMetrics.RecordHelmOperationEnd("upgrade")
+		return nil, fmt.Errorf("failed to load chart: %v", err)
+	}
+
+	// 创建升级客户端
+	client := action.NewUpgrade(cfg)
+	client.Namespace = namespace
+	client.Timeout = time.Duration(m.cfg.Helm.Timeout) * time.Second
+	client.Atomic = true // 生产环境必须 Atomic
+	client.Wait = true   // 升级默认等待完成
+
+	// 执行升级
+	rel, err = client.Run(name, loadedChart, values)
+	if err != nil {
+		duration := time.Since(startTime)
+		promMetrics.RecordHelmFailure("upgrade", err.Error())
+		promMetrics.RecordHelmOperation("upgrade", "failed", duration)
+		promMetrics.RecordHelmOperationEnd("upgrade")
+		return nil, fmt.Errorf("failed to upgrade release: %v", err)
+	}
+
+	// 记录成功
+	duration := time.Since(startTime)
+	promMetrics.RecordHelmOperation("upgrade", "success", duration)
+	promMetrics.RecordHelmOperationEnd("upgrade")
+
+	m.logger.Info("Application upgraded successfully", zap.String("name", name), zap.String("ns", namespace), zap.Duration("duration", duration))
+	return rel, nil
+}
+
+// RollbackApp 回滚应用
+func (m *HelmManager) RollbackApp(namespace, name string, revision int) (*release.Release, error) {
+	startTime := time.Now()
+
+	// 获取 Prometheus 指标实例
+	promMetrics := GetPrometheusMetrics()
+
+	// 记录 Helm 操作开始
+	promMetrics.RecordHelmOperationStart("rollback")
+
+	// 获取锁 (Namespace + Name)
+	lockKey := fmt.Sprintf("%s/%s", namespace, name)
+	muRaw, _ := m.keyLock.LoadOrStore(lockKey, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+
+	// 尝试加锁，避免同一应用并发操作
+	mu.Lock()
+	defer mu.Unlock()
+
+	m.logger.Info("Rolling back application", zap.String("name", name), zap.String("ns", namespace), zap.Int("revision", revision))
+
+	// 初始化 Helm 配置
+	cfg, err := m.getActionConfig(namespace)
+	if err != nil {
+		promMetrics.RecordHelmFailure("rollback", "config_failed")
+		promMetrics.RecordHelmOperationEnd("rollback")
+		return nil, fmt.Errorf("failed to get action config: %v", err)
+	}
+
+	// 创建回滚客户端
+	client := action.NewRollback(cfg)
+	client.Timeout = time.Duration(m.cfg.Helm.Timeout) * time.Second
+	client.Wait = true   // 回滚默认等待完成
+	client.Recreate = true
+
+	if revision > 0 {
+		client.Version = revision
+	}
+
+	// 执行回滚
+	err = client.Run(name)
+	if err != nil {
+		duration := time.Since(startTime)
+		promMetrics.RecordHelmFailure("rollback", err.Error())
+		promMetrics.RecordHelmOperation("rollback", "failed", duration)
+		promMetrics.RecordHelmOperationEnd("rollback")
+		return nil, fmt.Errorf("failed to rollback release: %v", err)
+	}
+
+	// 获取回滚后的状态
+	statusClient := action.NewStatus(cfg)
+	rel, err := statusClient.Run(name)
+	if err != nil {
+		promMetrics.RecordHelmFailure("rollback", "status_check_failed")
+		promMetrics.RecordHelmOperationEnd("rollback")
+		return nil, fmt.Errorf("failed to get status after rollback: %v", err)
+	}
+
+	// 记录成功
+	duration := time.Since(startTime)
+	promMetrics.RecordHelmOperation("rollback", "success", duration)
+	promMetrics.RecordHelmOperationEnd("rollback")
+
+	m.logger.Info("Application rolled back successfully", zap.String("name", name), zap.String("ns", namespace), zap.Duration("duration", duration))
+	return rel, nil
 }

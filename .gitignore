@@ -1,0 +1,76 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+helm-proxy
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# IDE directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Custom directories
+.claude/
+temp/
+tmp/
+
+# Config files (for local development)
+config-local.yaml
+.env
+.env.local
+.env.*.local
+
+# Log files
+*.log
+logs/
+
+# Kubernetes config
+kubeconfig
+
+# Build directory
+dist/
+build/
+
+# GitHub release artifacts (built by CI/CD)
+helm-proxy-*
+*.sha256
+
+# Test coverage
+coverage.txt
+coverage.out
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.csr

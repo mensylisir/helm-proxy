@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -20,30 +21,44 @@ import (
 
 // Server HTTP服务器结构体
 type Server struct {
-	config     *config.Config
-	logger     *zap.Logger
-	manager    *core.HelmManager
-	engine     *gin.Engine
-	router     *routes.Router
+	config       *config.Config
+	logger       *zap.Logger
+	manager      *core.HelmManager
+	engine       *gin.Engine
+	router       *routes.Router
+	auditLogger  *middleware.AuditLogger
+	tracing      *core.TracingProvider
 }
 
 // NewServer 创建新的HTTP服务器
 func NewServer(cfg *config.Config, logger *zap.Logger) *Server {
 	// 初始化Helm管理器
 	manager := core.NewManagerWithProduction(cfg, config.DefaultProductionConfig(), logger)
-	
+
+	// 初始化链路追踪
+	tracingProvider, err := core.InitTracing(&cfg.Tracing, logger)
+	if err != nil {
+		logger.Warn("Failed to initialize tracing", zap.Error(err))
+	}
+
+	// 创建审计日志器
+	logDir := filepath.Join(cfg.Helm.CacheDir, "audit")
+	auditLogger := middleware.NewAuditLogger(logDir, 10000, logger)
+
 	// 创建Gin引擎
 	engine := gin.New()
-	
+
 	// 创建服务器实例
 	server := &Server{
-		config:  cfg,
-		logger:  logger,
-		manager: manager,
-		engine:  engine,
-		router:  routes.NewRouter(engine, manager, cfg, logger),
+		config:       cfg,
+		logger:       logger,
+		manager:      manager,
+		engine:       engine,
+		router:       routes.NewRouter(engine, manager, cfg, logger),
+		auditLogger:  auditLogger,
+		tracing:      tracingProvider,
 	}
-	
+
 	return server
 }
 
@@ -56,7 +71,7 @@ func (s *Server) SetupMiddleware() {
 	s.engine.Use(middleware.RequestIDGenerator())
 
 	// 审计日志中间件（在早期记录所有请求）
-	s.engine.Use(middleware.AuditMiddleware(s.logger))
+	s.engine.Use(middleware.AuditMiddleware(s.auditLogger))
 
 	// 结构化日志中间件
 	s.engine.Use(middleware.StructuredLogger(s.logger))

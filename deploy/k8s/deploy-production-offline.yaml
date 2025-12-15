@@ -95,7 +95,7 @@ spec:
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8443"
-        prometheus.io/path: "/v1/monitor/metrics"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: helm-proxy-sa
       securityContext:
@@ -184,14 +184,14 @@ spec:
           value: "true"
         - name: INTERNAL_REGISTRY_ONLY
           value: "true"
-        # 资源限制
+        # 资源限制（优化生产环境）
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "512Mi"      # 增加请求内存，保证稳定性
+            cpu: "500m"          # 增加请求 CPU，保证性能
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "2Gi"        # 增加限制内存，支持高负载
+            cpu: "2000m"         # 增加限制 CPU，支持突发负载
         # 健康检查
         livenessProbe:
           httpGet:
@@ -323,7 +323,8 @@ metadata:
   labels:
     app: helm-proxy
 spec:
-  minAvailable: 2
+  # 最小可用实例数（与 HPA 的 minReplicas 保持一致）
+  minAvailable: 3
   selector:
     matchLabels:
       app: helm-proxy

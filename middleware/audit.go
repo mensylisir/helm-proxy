@@ -1,9 +1,15 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +38,7 @@ const (
 	ActionView      AuditAction = "view"
 	ActionLogin     AuditAction = "login"
 	ActionLogout    AuditAction = "logout"
+	ActionAPICall   AuditAction = "api.call"
 )
 
 // AuditResource 审计资源类型
@@ -51,6 +58,7 @@ type AuditResult string
 const (
 	ResultSuccess AuditResult = "success"
 	ResultFailure AuditResult = "failure"
+	ResultWarning AuditResult = "warning"
 )
 
 // AuditLog 审计日志结构体
@@ -74,10 +82,12 @@ type AuditLog struct {
 	Method       string         `json:"method"`
 	Path         string         `json:"path"`
 	QueryParams  map[string]string `json:"queryParams,omitempty"`
+	RequestBody  string         `json:"requestBody,omitempty"`
 
 	// 响应信息
 	StatusCode   int            `json:"statusCode"`
 	ResponseTime time.Duration  `json:"responseTime"`
+	ResponseSize int64          `json:"responseSize"`
 
 	// 详细信息
 	Message      string         `json:"message"`
@@ -87,27 +97,45 @@ type AuditLog struct {
 	ErrorMessage string         `json:"errorMessage,omitempty"`
 }
 
-// String 返回JSON格式的审计日志
-func (a *AuditLog) String() string {
-	data, _ := json.Marshal(a)
-	return string(data)
-}
-
 // AuditLogger 审计日志器
 type AuditLogger struct {
-	logger *zap.Logger
+	mu      sync.RWMutex
+	logs    []*AuditLog
+	logDir  string
+	maxLogs int
+	logger  *zap.Logger
 }
 
 // NewAuditLogger 创建新的审计日志器
-func NewAuditLogger(logger *zap.Logger) *AuditLogger {
+func NewAuditLogger(logDir string, maxLogs int, logger *zap.Logger) *AuditLogger {
+	// 创建日志目录
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		logger.Warn("Failed to create audit log directory", zap.String("dir", logDir), zap.Error(err))
+	}
+
 	return &AuditLogger{
-		logger: logger,
+		logs:    make([]*AuditLog, 0, maxLogs),
+		logDir:  logDir,
+		maxLogs: maxLogs,
+		logger:  logger,
 	}
 }
 
 // Log 记录审计日志
 func (l *AuditLogger) Log(audit *AuditLog) {
-	// 将审计日志转换为结构化日志
+	// 添加到内存缓冲区
+	l.mu.Lock()
+	l.logs = append(l.logs, audit)
+	// 限制日志数量
+	if len(l.logs) > l.maxLogs {
+		l.logs = l.logs[1:]
+	}
+	l.mu.Unlock()
+
+	// 写入文件
+	l.writeToFile(audit)
+
+	// 记录到结构化日志
 	l.logger.Info("Audit log",
 		zap.String("timestamp", audit.Timestamp.Format(time.RFC3339)),
 		zap.String("level", string(audit.Level)),
@@ -122,13 +150,100 @@ func (l *AuditLogger) Log(audit *AuditLog) {
 		zap.String("requestId", audit.RequestID),
 		zap.String("method", audit.Method),
 		zap.String("path", audit.Path),
-		zap.Any("queryParams", audit.QueryParams),
 		zap.Int("statusCode", audit.StatusCode),
 		zap.String("responseTime", audit.ResponseTime.String()),
-		zap.String("message", audit.Message),
-		zap.Any("details", audit.Details),
-		zap.String("errorMessage", audit.ErrorMessage),
+		zap.Int64("responseSize", audit.ResponseSize),
 	)
+}
+
+// writeToFile 写入文件
+func (l *AuditLogger) writeToFile(audit *AuditLog) {
+	// 按日期创建日志文件
+	dateStr := audit.Timestamp.Format("2006-01-02")
+	logFile := filepath.Join(l.logDir, fmt.Sprintf("audit-%s.log", dateStr))
+
+	// 序列化日志
+	line, err := json.Marshal(audit)
+	if err != nil {
+		l.logger.Error("Failed to marshal audit log", zap.Error(err))
+		return
+	}
+	line = append(line, '\n')
+
+	// 写入文件（追加模式）
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		l.logger.Error("Failed to open audit log file", zap.String("file", logFile), zap.Error(err))
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(line); err != nil {
+		l.logger.Error("Failed to write audit log", zap.String("file", logFile), zap.Error(err))
+	}
+}
+
+// Query 查询审计日志
+func (l *AuditLogger) Query(filter AuditLogFilter) ([]*AuditLog, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var results []*AuditLog
+
+	for _, log := range l.logs {
+		// 应用过滤条件
+		if filter.StartTime != nil && log.Timestamp.Before(*filter.StartTime) {
+			continue
+		}
+		if filter.EndTime != nil && log.Timestamp.After(*filter.EndTime) {
+			continue
+		}
+		if filter.Action != nil && log.Action != *filter.Action {
+			continue
+		}
+		if filter.Resource != nil && log.Resource != *filter.Resource {
+			continue
+		}
+		if filter.Result != nil && log.Result != *filter.Result {
+			continue
+		}
+		if filter.Username != "" && log.Username != filter.Username {
+			continue
+		}
+		if filter.RequestID != "" && log.RequestID != filter.RequestID {
+			continue
+		}
+
+		results = append(results, log)
+	}
+
+	return results, nil
+}
+
+// GetRecentLogs 获取最近的审计日志
+func (l *AuditLogger) GetRecentLogs(limit int) []*AuditLog {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if limit <= 0 || limit > len(l.logs) {
+		limit = len(l.logs)
+	}
+
+	// 返回最近的日志（倒序）
+	result := make([]*AuditLog, limit)
+	copy(result, l.logs[len(l.logs)-limit:])
+	return result
+}
+
+// AuditLogFilter 审计日志过滤条件
+type AuditLogFilter struct {
+	StartTime *time.Time
+	EndTime   *time.Time
+	Action    *AuditAction
+	Resource  *AuditResource
+	Result    *AuditResult
+	Username  string
+	RequestID string
 }
 
 // ExtractUserID 从请求中提取用户ID
@@ -156,17 +271,31 @@ func ExtractUsername(c *gin.Context) string {
 }
 
 // AuditMiddleware 审计中间件
-func AuditMiddleware(logger *zap.Logger) gin.HandlerFunc {
-	auditLogger := NewAuditLogger(logger)
-
+func AuditMiddleware(auditLogger *AuditLogger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 跳过审计的路径
+		if isSkippedPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		// 记录开始时间
 		startTime := time.Now()
 
-		// 从上下文中获取请求ID（由RequestIDGenerator中间件生成）
+		// 读取请求体
+		var requestBody string
+		if c.Request.Body != nil {
+			bodyBytes, _ := io.ReadAll(c.Request.Body)
+			requestBody = string(bodyBytes)
+			// 重新设置请求体，供后续处理使用
+			c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		// 从上下文中获取请求ID
 		requestID, _ := c.Get("request_id")
 		if requestID == nil {
 			requestID = GenerateRequestID()
+			c.Set("request_id", requestID)
 		}
 
 		// 创建审计日志
@@ -185,6 +314,7 @@ func AuditMiddleware(logger *zap.Logger) gin.HandlerFunc {
 			Method:      c.Request.Method,
 			Path:        c.Request.URL.Path,
 			QueryParams: extractQueryParams(c),
+			RequestBody: sanitizeRequestBody(requestBody),
 			StatusCode:  200,
 			Message:     "",
 			Details:     make(map[string]interface{}),
@@ -218,6 +348,55 @@ func AuditMiddleware(logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
+// isSkippedPath 检查路径是否跳过审计
+func isSkippedPath(path string) bool {
+	skipPaths := []string{
+		"/metrics",
+		"/metrics/custom",
+		"/health",
+		"/v1/monitor/health",
+		"/v1/monitor/metrics",
+		"/favicon.ico",
+		"/swagger",
+	}
+
+	for _, skipPath := range skipPaths {
+		if strings.HasPrefix(path, skipPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeRequestBody 脱敏请求体中的敏感信息
+func sanitizeRequestBody(body string) string {
+	if body == "" {
+		return body
+	}
+
+	// 敏感字段列表
+	sensitiveFields := []string{
+		"password", "secret", "token", "key", "credential",
+		"jwt", "auth", "private", "cert", "ca",
+	}
+
+	sanitized := body
+
+	for _, field := range sensitiveFields {
+		// 替换敏感字段的值
+		pattern := fmt.Sprintf(`"%s"\s*:\s*"[^"]*"`, field)
+		replacement := fmt.Sprintf(`"%s":"***REDACTED***"`, field)
+		sanitized = strings.ReplaceAll(sanitized, pattern, replacement)
+
+		// 处理单引号
+		pattern = fmt.Sprintf(`'%s'\s*:\s*'[^']*'`, field)
+		replacement = fmt.Sprintf(`'%s':'***REDACTED***'`, field)
+		sanitized = strings.ReplaceAll(sanitized, pattern, replacement)
+	}
+
+	return sanitized
+}
+
 // extractQueryParams 提取查询参数
 func extractQueryParams(c *gin.Context) map[string]string {
 	params := make(map[string]string)
@@ -234,18 +413,18 @@ func inferResourceAndAction(audit *AuditLog, c *gin.Context) *AuditLog {
 	path := c.Request.URL.Path
 	method := c.Request.Method
 
-	// 应用相关操作
-	if contains(path, "/app") {
+	// 应用部署相关
+	if strings.HasPrefix(path, "/v3/projects/") && strings.Contains(path, "/app") {
 		audit.Resource = ResourceApp
 		audit.ResourceID = c.Param("name")
 
 		switch method {
 		case http.MethodPost:
-			if contains(path, "/app") && !contains(path, "/apps/") {
+			if strings.HasSuffix(path, "/app") {
 				audit.Action = ActionCreate
-			} else if contains(path, "/upgrade") {
+			} else if strings.Contains(path, "/upgrade") {
 				audit.Action = ActionUpgrade
-			} else if contains(path, "/rollback") {
+			} else if strings.Contains(path, "/rollback") {
 				audit.Action = ActionRollback
 			} else {
 				audit.Action = ActionDeploy
@@ -260,7 +439,7 @@ func inferResourceAndAction(audit *AuditLog, c *gin.Context) *AuditLog {
 	}
 
 	// 用户相关操作
-	if contains(path, "/user") {
+	if strings.Contains(path, "/user") {
 		audit.Resource = ResourceUser
 		audit.ResourceID = c.Param("id")
 
@@ -277,7 +456,7 @@ func inferResourceAndAction(audit *AuditLog, c *gin.Context) *AuditLog {
 	}
 
 	// 配置相关操作
-	if contains(path, "/config") {
+	if strings.Contains(path, "/config") {
 		audit.Resource = ResourceConfig
 
 		switch method {
@@ -291,10 +470,15 @@ func inferResourceAndAction(audit *AuditLog, c *gin.Context) *AuditLog {
 	}
 
 	// 健康检查和就绪检查
-	if contains(path, "/health") || contains(path, "/ready") {
+	if strings.Contains(path, "/health") || strings.Contains(path, "/ready") {
 		audit.Resource = ResourceSystem
 		audit.Action = ActionView
 		audit.Level = AuditLevelInfo
+	}
+
+	// API调用
+	if audit.Resource == ResourceSystem && audit.Action == ActionView {
+		audit.Action = ActionAPICall
 	}
 
 	// 添加资源详情到消息
@@ -309,44 +493,15 @@ func inferResourceAndAction(audit *AuditLog, c *gin.Context) *AuditLog {
 	return audit
 }
 
-// contains 检查字符串是否包含子字符串
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && s[:len(substr)] == substr ||
-		   len(s) > len(substr) && s[len(s)-len(substr):] == substr ||
-		   len(s) > len(substr) && findSubstring(s, substr)
-}
-
-// findSubstring 查找子字符串（简化版）
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // LogAuditEvent 手动记录审计事件
 func LogAuditEvent(logger *zap.Logger, action AuditAction, resource AuditResource, resourceID string, result AuditResult, message string, details map[string]interface{}) {
-	auditLogger := NewAuditLogger(logger)
-
-	audit := &AuditLog{
-		Timestamp:   time.Now(),
-		Level:       AuditLevelInfo,
-		Action:      action,
-		Resource:    resource,
-		ResourceID:  resourceID,
-		Result:      result,
-		Message:     message,
-		Details:     details,
-		IPAddress:   "system",
-		UserAgent:   "helm-proxy",
-		RequestID:   "system",
-		Method:      "SYSTEM",
-		Path:        "internal",
-		StatusCode:  0,
-		ResponseTime: 0,
-	}
-
-	auditLogger.Log(audit)
+	// 记录到结构化日志
+	logger.Info("Manual audit event",
+		zap.String("action", string(action)),
+		zap.String("resource", string(resource)),
+		zap.String("resourceId", resourceID),
+		zap.String("result", string(result)),
+		zap.String("message", message),
+		zap.Any("details", details),
+	)
 }

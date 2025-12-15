@@ -78,3 +78,34 @@ production:
   offlineMode: true
   internalRegistryOnly: true
   disableExternalRepos: true
+
+# 缓存配置（增强版）
+cache:
+  # Chart 缓存
+  chartCache:
+    enabled: true
+    maxSize: 500        # 增加缓存数量
+    ttl: 7200          # 2小时 TTL
+    cleanupInterval: 300  # 5分钟清理一次
+
+  # 仓库缓存
+  repoCache:
+    enabled: true
+    refreshInterval: 3600  # 1小时刷新一次
+    maxRepos: 50
+
+  # 配置缓存
+  configCache:
+    enabled: true
+    maxSize: 200
+    ttl: 3600  # 1小时
+
+  # DNS 缓存
+  dnsCache:
+    enabled: true
+    ttl: 300  # 5分钟
+
+  # 内存缓存优化
+  memory:
+    gcTriggerBytes: 104857600  # 100MB 触发 GC
+    maxAllocBytes: 1073741824  # 1GB 最大分配
