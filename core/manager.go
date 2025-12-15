@@ -15,7 +15,7 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/strvals"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/google/uuid"
 	"github.com/mensylisir/helm-proxy/config"
@@ -141,10 +141,10 @@ type ChartCache struct {
 
 // ChartEntry Chart 缓存条目
 type ChartEntry struct {
-	ChartPath string
+	ChartPath    string
 	DownloadedAt time.Time
-	Version    string
-	ChartName  string
+	Version      string
+	ChartName    string
 }
 
 // NewChartCache 创建新的Chart缓存
@@ -471,7 +471,7 @@ func (m *HelmManager) ListApps(namespace string) ([]*model.RancherResponse, erro
 
 	// 2. 使用 Helm SDK 列出所有 releases
 	listClient := action.NewList(cfg)
-	listClient.All = true  // 获取所有 releases，包括已卸载的
+	listClient.All = true // 获取所有 releases，包括已卸载的
 	// 注意：也可以使用 listClient.Deployed = true 只获取已部署的
 
 	releases, err := listClient.Run()
@@ -521,16 +521,49 @@ func (m *HelmManager) ListAllApps() ([]*model.RancherResponse, error) {
 
 // getAllNamespaces 获取所有命名空间
 func (m *HelmManager) getAllNamespaces() ([]string, error) {
-	// 这里简化处理，实际应该查询 Kubernetes API
-	// 为演示目的，返回常用命名空间列表
-	return []string{
-		"default",
-		"kube-system",
-		"kube-public",
-		"cattle-system",
-		"cattle-prometheus",
-		"fleet-system",
-	}, nil
+	m.logger.Info("🚀 getAllNamespaces called")
+
+	// 使用 Helm list 命令获取所有命名空间中的 releases
+	// 需要一个默认的 namespace 来初始化
+	// 使用空字符串，因为我们要列出所有命名空间
+	actionConfig, err := m.getActionConfig("")
+	if err != nil {
+		m.logger.Error("Failed to get action config", zap.Error(err))
+		return nil, fmt.Errorf("failed to get action config: %v", err)
+	}
+
+	m.logger.Info("Creating list client with AllNamespaces=true")
+	listClient := action.NewList(actionConfig)
+	listClient.AllNamespaces = true
+	// 不设置 listClient.Namespace，让它列出所有命名空间
+
+	m.logger.Info("Running helm list command")
+	releases, err := listClient.Run()
+	if err != nil {
+		m.logger.Error("Failed to list releases", zap.Error(err))
+		return nil, fmt.Errorf("failed to list releases: %v", err)
+	}
+
+	m.logger.Info("Helm list returned releases", zap.Int("count", len(releases)))
+
+	// 提取唯一的命名空间列表
+	namespaceSet := make(map[string]bool)
+	for _, rel := range releases {
+		if rel.Namespace != "" {
+			namespaceSet[rel.Namespace] = true
+		}
+	}
+
+	// 转换为切片
+	var namespaces []string
+	for ns := range namespaceSet {
+		namespaces = append(namespaces, ns)
+	}
+
+	// 调试日志
+	m.logger.Info("✅ Found namespaces", zap.Int("count", len(namespaces)), zap.Strings("namespaces", namespaces))
+
+	return namespaces, nil
 }
 
 // mapHelmStateToRancher 将 Helm release 状态转换为 Rancher 兼容的状态
@@ -556,13 +589,27 @@ func (m *HelmManager) mapHelmStateToRancher(rel *release.Release) string {
 func (m *HelmManager) getActionConfig(namespace string) (*action.Configuration, error) {
 	actionConfig := new(action.Configuration)
 
-	// 使用 K8s 标准库加载配置 (InCluster 或 ~/.kube/config)
-	cf := genericclioptions.NewConfigFlags(true)
+	// 使用 Helm CLI 环境设置
+	settings := cli.New()
 
-	// 绑定 namespace
-	cf.Namespace = &namespace
+	// 明确加载 kubeconfig
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = os.ExpandEnv("$HOME/.kube/config")
+	}
 
-	if err := actionConfig.Init(cf, namespace, m.cfg.Helm.Driver, func(format string, v ...interface{}) {
+	// 使用 clientcmd 明确加载 kubeconfig
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		m.logger.Error("Failed to build config from kubeconfig", zap.Error(err), zap.String("kubeconfig", kubeconfig))
+		return nil, fmt.Errorf("failed to build config from kubeconfig: %v", err)
+	}
+	m.logger.Info("Successfully loaded kubeconfig", zap.String("path", kubeconfig), zap.String("host", config.Host))
+
+	// 使用 Settings 的 RESTClientGetter
+	restClientGetter := settings.RESTClientGetter()
+
+	if err := actionConfig.Init(restClientGetter, namespace, m.cfg.Helm.Driver, func(format string, v ...interface{}) {
 		// 将 Helm 内部日志重定向到 Zap
 		m.logger.Debug(fmt.Sprintf(format, v...))
 	}); err != nil {
@@ -685,10 +732,10 @@ func (m *HelmManager) downloadChart(chartRef, version string, cfg *action.Config
 
 	// 将下载的Chart放入缓存
 	entry := &ChartEntry{
-		ChartPath:   cp,
+		ChartPath:    cp,
 		DownloadedAt: time.Now(),
-		Version:     version,
-		ChartName:   chartRef,
+		Version:      version,
+		ChartName:    chartRef,
 	}
 	m.chartCache.Set(cacheKey, entry)
 
@@ -1009,7 +1056,7 @@ func (m *HelmManager) RollbackApp(namespace, name string, revision int) (*releas
 	// 创建回滚客户端
 	client := action.NewRollback(cfg)
 	client.Timeout = time.Duration(m.cfg.Helm.Timeout) * time.Second
-	client.Wait = true   // 回滚默认等待完成
+	client.Wait = true // 回滚默认等待完成
 	client.Recreate = true
 
 	if revision > 0 {

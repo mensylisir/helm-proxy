@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -39,6 +40,11 @@ func TestSetupRoutes(t *testing.T) {
 }
 
 func TestDeployApp(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -59,7 +65,7 @@ func TestDeployApp(t *testing.T) {
 	// Create test request
 	reqBody := model.RancherRequest{
 		Name:            "test-app",
-		TargetNamespace: "default",
+		TargetNamespace: "test-namespace",
 		ExternalID:      "catalog://?catalog=myrepo&template=podinfo&version=6.5.4",
 		ProjectID:       "c-test:p-test",
 		Answers: map[string]string{
@@ -99,6 +105,11 @@ func TestDeployApp(t *testing.T) {
 }
 
 func TestGetAppStatus(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -119,7 +130,7 @@ func TestGetAppStatus(t *testing.T) {
 	// First deploy an app
 	reqBody := model.RancherRequest{
 		Name:            "test-status-app",
-		TargetNamespace: "default",
+		TargetNamespace: "test-namespace",
 		ExternalID:      "catalog://?catalog=myrepo&template=podinfo&version=6.5.4",
 		ProjectID:       "c-test:p-test",
 		Answers: map[string]string{
@@ -153,6 +164,11 @@ func TestGetAppStatus(t *testing.T) {
 }
 
 func TestListApps(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -193,6 +209,11 @@ func TestListApps(t *testing.T) {
 }
 
 func TestDeleteApp(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -213,7 +234,7 @@ func TestDeleteApp(t *testing.T) {
 	// First deploy an app to delete
 	reqBody := model.RancherRequest{
 		Name:            "test-delete-app",
-		TargetNamespace: "default",
+		TargetNamespace: "test-namespace",
 		ExternalID:      "catalog://?catalog=myrepo&template=podinfo&version=6.5.4",
 		ProjectID:       "c-test:p-test",
 		Answers: map[string]string{
@@ -256,6 +277,11 @@ func TestDeleteApp(t *testing.T) {
 }
 
 func TestUpgradeApp(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -276,7 +302,7 @@ func TestUpgradeApp(t *testing.T) {
 	// First deploy an app to upgrade
 	reqBody := model.RancherRequest{
 		Name:            "test-upgrade-app",
-		TargetNamespace: "default",
+		TargetNamespace: "test-namespace",
 		ExternalID:      "catalog://?catalog=myrepo&template=podinfo&version=6.5.4",
 		ProjectID:       "c-test:p-test",
 		Answers: map[string]string{
@@ -313,6 +339,11 @@ func TestUpgradeApp(t *testing.T) {
 }
 
 func TestRollbackApp(t *testing.T) {
+	// Skip test if SKIP_EXTERNAL_TESTS is set
+	if os.Getenv("SKIP_EXTERNAL_TESTS") != "" {
+		t.Skip("Skipping test that requires external resources")
+	}
+
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Port: "8443",
@@ -333,7 +364,7 @@ func TestRollbackApp(t *testing.T) {
 	// First deploy an app to rollback
 	reqBody := model.RancherRequest{
 		Name:            "test-rollback-app",
-		TargetNamespace: "default",
+		TargetNamespace: "test-namespace",
 		ExternalID:      "catalog://?catalog=myrepo&template=podinfo&version=6.5.4",
 		ProjectID:       "c-test:p-test",
 		Answers: map[string]string{

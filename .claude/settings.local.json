@@ -55,7 +55,17 @@
       "Bash(openssl:*)",
       "Bash(go get:*)",
       "Bash(go mod:*)",
-      "Bash(go test ./core -v:*)"
+      "Bash(go test ./core -v:*)",
+      "Bash(go test ./routes -v)",
+      "Bash(go test:*)",
+      "Bash(SKIP_EXTERNAL_TESTS=1 go test:*)",
+      "Bash(timeout 90 curl:*)",
+      "Bash(findstr:*)",
+      "Bash(jq:*)",
+      "Bash(/tmp/podinfo_test.sh)",
+      "Bash(/tmp/podinfo_test_8443.sh:*)",
+      "Bash(go run:*)",
+      "Bash(timeout 10 ./helm-proxy -config deploy/configs/config-production-offline.yaml)"
     ]
   }
 }

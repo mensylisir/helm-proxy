@@ -524,30 +524,178 @@ func (r *Router) updateApp(c *gin.Context) {
 // deleteApp 删除应用（v1 API）
 func (r *Router) deleteApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App deletion initiated",
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetNamespace string
+	var found bool
+	for _, app := range apps {
+		if app.Name == name {
+			targetNamespace = app.TargetNamespace
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 执行删除
+	err = r.manager.UninstallApp(targetNamespace, name)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Deletion failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"id":      fmt.Sprintf("default:%s", name),
 		"name":    name,
+		"state":   "removing",
+		"message": "Application deletion initiated",
 	})
 }
 
 // upgradeApp 升级应用
 func (r *Router) upgradeApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App upgrade initiated",
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetNamespace string
+	var found bool
+	for _, app := range apps {
+		if app.Name == name {
+			targetNamespace = app.TargetNamespace
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 从请求体中获取新的值
+	var req map[string]interface{}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
+		return
+	}
+
+	// 解析 values
+	var answers map[string]string
+	var valuesYaml string
+
+	// 类型转换 answers
+	if answersInterface, ok := req["answers"]; ok {
+		if answersMap, ok := answersInterface.(map[string]interface{}); ok {
+			answers = make(map[string]string)
+			for k, v := range answersMap {
+				if str, ok := v.(string); ok {
+					answers[k] = str
+				}
+			}
+		}
+	}
+
+	// 类型转换 valuesYaml
+	if valuesYamlInterface, ok := req["valuesYaml"]; ok {
+		if str, ok := valuesYamlInterface.(string); ok {
+			valuesYaml = str
+		}
+	}
+
+	vals, err := r.manager.ParseValues(answers, valuesYaml)
+	if err != nil {
+		middleware.HandleBadRequest(c, "Invalid values", err.Error())
+		return
+	}
+
+	// 执行升级
+	rel, err := r.manager.UpgradeApp(targetNamespace, name, "", vals)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Upgrade failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"id":      fmt.Sprintf("default:%s", name),
 		"name":    name,
+		"state":   "upgrading",
+		"version": rel.Chart.Name(),
+		"message": "Application upgrade initiated",
 	})
 }
 
 // rollbackApp 回滚应用
 func (r *Router) rollbackApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App rollback initiated",
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetNamespace string
+	var found bool
+	for _, app := range apps {
+		if app.Name == name {
+			targetNamespace = app.TargetNamespace
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 从请求体中获取 revision
+	var req map[string]interface{}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
+		return
+	}
+
+	revision := 0
+	if revisionInterface, ok := req["revision"]; ok {
+		if rev, ok := revisionInterface.(float64); ok {
+			revision = int(rev)
+		}
+	}
+
+	// 执行回滚
+	rel, err := r.manager.RollbackApp(targetNamespace, name, revision)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Rollback failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"id":      fmt.Sprintf("default:%s", name),
 		"name":    name,
+		"state":   "rolling-back",
+		"version": rel.Chart.Name(),
+		"message": "Application rollback initiated",
 	})
 }
 
