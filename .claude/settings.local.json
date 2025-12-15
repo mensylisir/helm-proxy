@@ -65,7 +65,10 @@
       "Bash(/tmp/podinfo_test.sh)",
       "Bash(/tmp/podinfo_test_8443.sh:*)",
       "Bash(go run:*)",
-      "Bash(timeout 10 ./helm-proxy -config deploy/configs/config-production-offline.yaml)"
+      "Bash(timeout 10 ./helm-proxy -config deploy/configs/config-production-offline.yaml)",
+      "Bash(printf \"测试1: 应用列表（获取所有应用）\\n\" curl -s http://localhost:10006/v1/apps)",
+      "Bash(printf \"\\n测试2: 应用详情（真实实现）\\n\" curl -s http://localhost:10006/v1/apps/argo111)",
+      "Bash(printf \"\\n测试3: Rancher兼容列表（修复硬编码namespace）\\n\" curl -s http://localhost:10006/v3/projects/c-test:ns-default/app)"
     ]
   }
 }

@@ -2,6 +2,7 @@ package routes
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -301,23 +302,31 @@ func (r *Router) getAppStatus(c *gin.Context) {
 func (r *Router) listApps(c *gin.Context) {
 	projectID := c.Param("projectId")
 
-	// 从项目ID中提取命名空间（简化处理，实际应该从项目ID解析）
-	namespace := "default"
-	if strings.Contains(projectID, ":") {
+	// 如果 projectID 是 "c-test:ns-xxx" 格式，提取命名空间
+	// 否则使用 ListAllApps 获取所有命名空间的应用
+	var apps []*model.RancherResponse
+	var err error
+
+	if projectID == "c-test:ns-default" || projectID == "default" {
+		// 特殊情况：Rancher UI 默认请求default项目
+		apps, err = r.manager.ListAllApps()
+	} else if strings.Contains(projectID, ":") {
+		// 解析 "c-test:ns-namespace" 格式
 		parts := strings.Split(projectID, ":")
 		if len(parts) >= 2 {
-			namespace = parts[1]
+			namespace := strings.TrimPrefix(parts[1], "ns-")
+			apps, err = r.manager.ListApps(namespace)
+		} else {
+			// 无法解析，回退到获取所有应用
+			apps, err = r.manager.ListAllApps()
 		}
 	} else {
-		namespace = projectID
+		// 直接使用 projectID 作为命名空间
+		apps, err = r.manager.ListApps(projectID)
 	}
-
-	// 从 Helm 获取应用列表
-	apps, err := r.manager.ListApps(namespace)
 	if err != nil {
 		r.logger.Warn("Failed to list apps",
 			zap.String("project_id", projectID),
-			zap.String("namespace", namespace),
 			zap.Error(err))
 		// 返回空列表而不是错误，避免前端崩溃
 		apps = []*model.RancherResponse{}
@@ -478,13 +487,29 @@ func (r *Router) listAppsV1(c *gin.Context) {
 // getAppDetail 获取应用详情（v1 API）
 func (r *Router) getAppDetail(c *gin.Context) {
 	name := c.Param("name")
-	
-	// 返回应用详情
-	app := map[string]interface{}{
-		"name": name,
-		"status": "running",
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
 	}
-	middleware.HandleSuccess(c, app)
+
+	// 查找指定名称的应用
+	var targetApp *model.RancherResponse
+	for _, app := range apps {
+		if app.Name == name {
+			targetApp = app
+			break
+		}
+	}
+
+	if targetApp == nil {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	middleware.HandleSuccess(c, targetApp)
 }
 
 // deployAppV1 部署应用（v1 API）
@@ -508,17 +533,63 @@ func (r *Router) deployAppV1(c *gin.Context) {
 // updateApp 更新应用（v1 API）
 func (r *Router) updateApp(c *gin.Context) {
 	name := c.Param("name")
-	var req interface{}
-	
+	var req model.RancherRequest
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
 		return
 	}
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App update initiated",
-		"name":    name,
-	})
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetApp *model.RancherResponse
+	for _, app := range apps {
+		if app.Name == name {
+			targetApp = app
+			break
+		}
+	}
+
+	if targetApp == nil {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 设置应用名称
+	req.Name = name
+	req.TargetNamespace = targetApp.TargetNamespace
+
+	// 调用升级功能
+	// 转换 map[string]string 到 map[string]interface{}
+	answers := make(map[string]interface{})
+	for k, v := range req.Answers {
+		answers[k] = v
+	}
+
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", answers)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "App upgrade failed", err.Error())
+		return
+	}
+
+	// 转换为 Rancher 响应格式
+	resp := &model.RancherResponse{
+		ID:               targetApp.ID,
+		Name:             name,
+		State:            "upgrading",
+		TargetNamespace:  targetApp.TargetNamespace,
+		ExternalID:       targetApp.ExternalID,
+		Created:          targetApp.Created,
+		CreatedTS:        targetApp.CreatedTS,
+	}
+
+	middleware.HandleSuccess(c, resp)
 }
 
 // deleteApp 删除应用（v1 API）
@@ -699,33 +770,129 @@ func (r *Router) rollbackApp(c *gin.Context) {
 	})
 }
 
-// restartApp 重启应用
+// restartApp 重启应用 - 通过重新部署实现
 func (r *Router) restartApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App restart initiated",
-		"name":    name,
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetApp *model.RancherResponse
+	for _, app := range apps {
+		if app.Name == name {
+			targetApp = app
+			break
+		}
+	}
+
+	if targetApp == nil {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 重启通过升级到相同版本实现（触发Pod重建）
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", nil)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Restart failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"message":   "App restart initiated",
+		"name":      name,
+		"namespace": targetApp.TargetNamespace,
+		"state":     "restarting",
 	})
 }
 
-// pauseApp 暂停应用
+// pauseApp 暂停应用 - 通过设置replicas为0实现
 func (r *Router) pauseApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App pause initiated",
-		"name":    name,
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetApp *model.RancherResponse
+	for _, app := range apps {
+		if app.Name == name {
+			targetApp = app
+			break
+		}
+	}
+
+	if targetApp == nil {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 暂停应用 - 通过设置 replicaCount=0
+	vals := map[string]interface{}{
+		"replicaCount": 0,
+	}
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", vals)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Pause failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"message":   "App pause initiated",
+		"name":      name,
+		"namespace": targetApp.TargetNamespace,
+		"state":     "paused",
 	})
 }
 
-// resumeApp 恢复应用
+// resumeApp 恢复应用 - 通过恢复replicas实现
 func (r *Router) resumeApp(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "App resume initiated",
-		"name":    name,
+
+	// 从所有命名空间中查找应用
+	apps, err := r.manager.ListAllApps()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to list apps", err.Error())
+		return
+	}
+
+	// 查找指定名称的应用
+	var targetApp *model.RancherResponse
+	for _, app := range apps {
+		if app.Name == name {
+			targetApp = app
+			break
+		}
+	}
+
+	if targetApp == nil {
+		middleware.HandleNotFound(c, "App not found", fmt.Sprintf("App %s not found", name))
+		return
+	}
+
+	// 恢复应用 - 通过设置 replicaCount=1
+	vals := map[string]interface{}{
+		"replicaCount": 1,
+	}
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", vals)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Resume failed", err.Error())
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"message":   "App resume initiated",
+		"name":      name,
+		"namespace": targetApp.TargetNamespace,
+		"state":     "active",
 	})
 }
 
@@ -746,63 +913,165 @@ func (r *Router) listRepos(c *gin.Context) {
 	middleware.HandlePaginatedSuccess(c, repos, int64(len(repos)), 1, 10)
 }
 
-// getRepoDetail 获取仓库详情
+// getRepoDetail 获取仓库详情 - 从配置读取真实URL
 func (r *Router) getRepoDetail(c *gin.Context) {
 	name := c.Param("name")
-	
+
+	// 从配置中查找仓库URL
+	url, exists := r.config.Helm.RepoMap[name]
+	if !exists {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found in configuration", name))
+		return
+	}
+
 	repo := map[string]interface{}{
-		"name": name,
-		"url":  "https://example.com",
+		"name":   name,
+		"url":    url,
+		"status": "active",
 	}
 	middleware.HandleSuccess(c, repo)
 }
 
-// addRepo 添加仓库
+// addRepo 添加仓库 - 通过helm repo add实现
 func (r *Router) addRepo(c *gin.Context) {
-	var req interface{}
+	var req struct {
+		Name     string `json:"name" binding:"required"`
+		URL      string `json:"url" binding:"required"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
 		return
 	}
-	
-	middleware.HandleSuccess(c, map[string]string{
+
+	// 检查仓库是否已存在
+	if _, exists := r.config.Helm.RepoMap[req.Name]; exists {
+		middleware.HandleBadRequest(c, "Repository already exists", fmt.Sprintf("Repository %s already exists", req.Name))
+		return
+	}
+
+	// 执行 helm repo add 命令
+	args := []string{"repo", "add", req.Name, req.URL, "--force-update"}
+	if req.Username != "" {
+		args = append(args, "--username", req.Username)
+	}
+	if req.Password != "" {
+		args = append(args, "--password", req.Password)
+	}
+
+	cmd := exec.Command("helm", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to add repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+		return
+	}
+
+	// 更新配置
+	r.config.Helm.RepoMap[req.Name] = req.URL
+
+	middleware.HandleSuccess(c, map[string]interface{}{
 		"message": "Repository added successfully",
+		"name":    req.Name,
+		"url":     req.URL,
 	})
 }
 
-// updateRepo 更新仓库
+// updateRepo 更新仓库 - 通过删除后重新添加实现
 func (r *Router) updateRepo(c *gin.Context) {
 	name := c.Param("name")
-	var req interface{}
-	
+	var req struct {
+		URL      string `json:"url" binding:"required"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		middleware.HandleBadRequest(c, "Invalid JSON", err.Error())
 		return
 	}
-	
-	middleware.HandleSuccess(c, map[string]string{
+
+	// 检查仓库是否存在
+	if _, exists := r.config.Helm.RepoMap[name]; !exists {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found", name))
+		return
+	}
+
+	// 执行 helm repo add --force-update 来更新仓库
+	args := []string{"repo", "add", name, req.URL, "--force-update"}
+	if req.Username != "" {
+		args = append(args, "--username", req.Username)
+	}
+	if req.Password != "" {
+		args = append(args, "--password", req.Password)
+	}
+
+	cmd := exec.Command("helm", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to update repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+		return
+	}
+
+	// 更新配置
+	r.config.Helm.RepoMap[name] = req.URL
+
+	middleware.HandleSuccess(c, map[string]interface{}{
 		"message": "Repository updated successfully",
 		"name":    name,
+		"url":     req.URL,
 	})
 }
 
-// deleteRepo 删除仓库
+// deleteRepo 删除仓库 - 通过helm repo remove实现
 func (r *Router) deleteRepo(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
+
+	// 检查仓库是否存在
+	if _, exists := r.config.Helm.RepoMap[name]; !exists {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found", name))
+		return
+	}
+
+	// 执行 helm repo remove
+	cmd := exec.Command("helm", "repo", "remove", name)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to delete repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+		return
+	}
+
+	// 从配置中删除
+	delete(r.config.Helm.RepoMap, name)
+
+	middleware.HandleSuccess(c, map[string]interface{}{
 		"message": "Repository deleted successfully",
 		"name":    name,
 	})
 }
 
-// refreshRepo 刷新仓库
+// refreshRepo 刷新仓库 - 通过helm repo update实现
 func (r *Router) refreshRepo(c *gin.Context) {
 	name := c.Param("name")
-	
-	middleware.HandleSuccess(c, map[string]string{
-		"message": "Repository refresh initiated",
+
+	// 检查仓库是否存在
+	if _, exists := r.config.Helm.RepoMap[name]; !exists {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found", name))
+		return
+	}
+
+	// 执行 helm repo update 指定仓库
+	cmd := exec.Command("helm", "repo", "update", name)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to refresh repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+		return
+	}
+
+	middleware.HandleSuccess(c, map[string]interface{}{
+		"message": "Repository refresh completed",
 		"name":    name,
+		"output":  string(output),
 	})
 }
 
