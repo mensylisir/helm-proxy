@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/repo"
 
 	"github.com/mensylisir/helm-proxy/api"
 	"github.com/mensylisir/helm-proxy/config"
@@ -770,7 +774,7 @@ func (r *Router) rollbackApp(c *gin.Context) {
 	})
 }
 
-// restartApp 重启应用 - 通过重新部署实现
+// restartApp 重启应用 - 使用Kubernetes原生重启
 func (r *Router) restartApp(c *gin.Context) {
 	name := c.Param("name")
 
@@ -795,8 +799,39 @@ func (r *Router) restartApp(c *gin.Context) {
 		return
 	}
 
-	// 重启通过升级到相同版本实现（触发Pod重建）
-	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", nil)
+	// 使用Helm SDK获取当前release
+	cfg, err := r.manager.GetActionConfig(targetApp.TargetNamespace)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get Helm config", err.Error())
+		return
+	}
+
+	// 获取release状态
+	statusClient := action.NewStatus(cfg)
+	rel, err := statusClient.Run(name)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get release status", err.Error())
+		return
+	}
+
+	// 获取当前的values
+	values := rel.Config
+
+	// 创建一个特殊的annotation来触发滚动重启
+	if values == nil {
+		values = map[string]interface{}{}
+	}
+	// 添加或更新annotation
+	if annotations, ok := values["annotations"].(map[string]interface{}); ok {
+		annotations["restartedAt"] = time.Now().Format(time.RFC3339)
+	} else {
+		values["annotations"] = map[string]interface{}{
+			"restartedAt": time.Now().Format(time.RFC3339),
+		}
+	}
+
+	// 使用修改后的values进行upgrade（会触发Pod重建）
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", values)
 	if err != nil {
 		middleware.HandleInternalServerError(c, "Restart failed", err.Error())
 		return
@@ -810,7 +845,7 @@ func (r *Router) restartApp(c *gin.Context) {
 	})
 }
 
-// pauseApp 暂停应用 - 通过设置replicas为0实现
+// pauseApp 暂停应用 - 使用现有chart版本设置replicas=0
 func (r *Router) pauseApp(c *gin.Context) {
 	name := c.Param("name")
 
@@ -835,11 +870,30 @@ func (r *Router) pauseApp(c *gin.Context) {
 		return
 	}
 
-	// 暂停应用 - 通过设置 replicaCount=0
+	// 获取当前chart版本
+	cfg, err := r.manager.GetActionConfig(targetApp.TargetNamespace)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get Helm config", err.Error())
+		return
+	}
+
+	// 获取release状态
+	statusClient := action.NewStatus(cfg)
+	rel, err := statusClient.Run(name)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get release status", err.Error())
+		return
+	}
+
+	// 获取当前chart和版本
+	chart := rel.Chart
+	version := chart.Metadata.Version
+
+	// 暂停应用 - 通过设置 replicaCount=0（使用现有版本）
 	vals := map[string]interface{}{
 		"replicaCount": 0,
 	}
-	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", vals)
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, version, vals)
 	if err != nil {
 		middleware.HandleInternalServerError(c, "Pause failed", err.Error())
 		return
@@ -850,10 +904,11 @@ func (r *Router) pauseApp(c *gin.Context) {
 		"name":      name,
 		"namespace": targetApp.TargetNamespace,
 		"state":     "paused",
+		"version":   version,
 	})
 }
 
-// resumeApp 恢复应用 - 通过恢复replicas实现
+// resumeApp 恢复应用 - 使用现有chart版本设置replicas=1
 func (r *Router) resumeApp(c *gin.Context) {
 	name := c.Param("name")
 
@@ -878,11 +933,30 @@ func (r *Router) resumeApp(c *gin.Context) {
 		return
 	}
 
-	// 恢复应用 - 通过设置 replicaCount=1
+	// 获取当前chart版本
+	cfg, err := r.manager.GetActionConfig(targetApp.TargetNamespace)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get Helm config", err.Error())
+		return
+	}
+
+	// 获取release状态
+	statusClient := action.NewStatus(cfg)
+	rel, err := statusClient.Run(name)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to get release status", err.Error())
+		return
+	}
+
+	// 获取当前chart和版本
+	chart := rel.Chart
+	version := chart.Metadata.Version
+
+	// 恢复应用 - 通过设置 replicaCount=1（使用现有版本）
 	vals := map[string]interface{}{
 		"replicaCount": 1,
 	}
-	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, "", vals)
+	_, err = r.manager.UpgradeApp(targetApp.TargetNamespace, name, version, vals)
 	if err != nil {
 		middleware.HandleInternalServerError(c, "Resume failed", err.Error())
 		return
@@ -893,6 +967,7 @@ func (r *Router) resumeApp(c *gin.Context) {
 		"name":      name,
 		"namespace": targetApp.TargetNamespace,
 		"state":     "active",
+		"version":   version,
 	})
 }
 
@@ -932,7 +1007,7 @@ func (r *Router) getRepoDetail(c *gin.Context) {
 	middleware.HandleSuccess(c, repo)
 }
 
-// addRepo 添加仓库 - 通过helm repo add实现
+// addRepo 添加仓库 - 使用 Helm SDK
 func (r *Router) addRepo(c *gin.Context) {
 	var req struct {
 		Name     string `json:"name" binding:"required"`
@@ -951,19 +1026,38 @@ func (r *Router) addRepo(c *gin.Context) {
 		return
 	}
 
-	// 执行 helm repo add 命令
-	args := []string{"repo", "add", req.Name, req.URL, "--force-update"}
-	if req.Username != "" {
-		args = append(args, "--username", req.Username)
-	}
-	if req.Password != "" {
-		args = append(args, "--password", req.Password)
+	// 使用 Helm SDK 的 repo 包添加仓库
+	// 获取 repo 文件路径
+	settings := cli.New()
+	repoFilePath := settings.RepositoryConfig
+
+	// 读取现有的 repo 文件
+	repoFile, err := repo.LoadFile(repoFilePath)
+	if err != nil {
+		// 如果文件不存在，创建新的
+		repoFile = repo.NewFile()
 	}
 
-	cmd := exec.Command("helm", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		middleware.HandleInternalServerError(c, "Failed to add repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+	// 检查仓库是否已存在
+	if repoFile.Has(req.Name) {
+		middleware.HandleBadRequest(c, "Repository already exists", fmt.Sprintf("Repository %s already exists in Helm", req.Name))
+		return
+	}
+
+	// 创建新的 repo 条目
+	entry := &repo.Entry{
+		Name:     req.Name,
+		URL:      req.URL,
+		Username: req.Username,
+		Password: req.Password,
+	}
+
+	// 添加到 repo 文件
+	repoFile.Add(entry)
+
+	// 保存文件
+	if err := repoFile.WriteFile(repoFilePath, 0644); err != nil {
+		middleware.HandleInternalServerError(c, "Failed to save repository", err.Error())
 		return
 	}
 
@@ -977,7 +1071,7 @@ func (r *Router) addRepo(c *gin.Context) {
 	})
 }
 
-// updateRepo 更新仓库 - 通过删除后重新添加实现
+// updateRepo 更新仓库 - 使用 Helm SDK
 func (r *Router) updateRepo(c *gin.Context) {
 	name := c.Param("name")
 	var req struct {
@@ -997,19 +1091,40 @@ func (r *Router) updateRepo(c *gin.Context) {
 		return
 	}
 
-	// 执行 helm repo add --force-update 来更新仓库
-	args := []string{"repo", "add", name, req.URL, "--force-update"}
-	if req.Username != "" {
-		args = append(args, "--username", req.Username)
-	}
-	if req.Password != "" {
-		args = append(args, "--password", req.Password)
+	// 使用 Helm SDK 更新仓库
+	settings := cli.New()
+	repoFilePath := settings.RepositoryConfig
+
+	// 读取现有的 repo 文件
+	repoFile, err := repo.LoadFile(repoFilePath)
+	if err != nil {
+		middleware.HandleInternalServerError(c, "Failed to load repository file", err.Error())
+		return
 	}
 
-	cmd := exec.Command("helm", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		middleware.HandleInternalServerError(c, "Failed to update repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+	// 检查仓库是否存在
+	if !repoFile.Has(name) {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found in Helm", name))
+		return
+	}
+
+	// 删除现有条目
+	repoFile.Remove(name)
+
+	// 创建新的 repo 条目
+	entry := &repo.Entry{
+		Name:     name,
+		URL:      req.URL,
+		Username: req.Username,
+		Password: req.Password,
+	}
+
+	// 添加更新的条目
+	repoFile.Add(entry)
+
+	// 保存文件
+	if err := repoFile.WriteFile(repoFilePath, 0644); err != nil {
+		middleware.HandleInternalServerError(c, "Failed to save repository", err.Error())
 		return
 	}
 
@@ -1023,7 +1138,7 @@ func (r *Router) updateRepo(c *gin.Context) {
 	})
 }
 
-// deleteRepo 删除仓库 - 通过helm repo remove实现
+// deleteRepo 删除仓库 - 使用 Helm SDK
 func (r *Router) deleteRepo(c *gin.Context) {
 	name := c.Param("name")
 
@@ -1033,11 +1148,29 @@ func (r *Router) deleteRepo(c *gin.Context) {
 		return
 	}
 
-	// 执行 helm repo remove
-	cmd := exec.Command("helm", "repo", "remove", name)
-	output, err := cmd.CombinedOutput()
+	// 使用 Helm SDK 删除仓库
+	settings := cli.New()
+	repoFilePath := settings.RepositoryConfig
+
+	// 读取现有的 repo 文件
+	repoFile, err := repo.LoadFile(repoFilePath)
 	if err != nil {
-		middleware.HandleInternalServerError(c, "Failed to delete repository", fmt.Sprintf("%s: %s", err.Error(), string(output)))
+		middleware.HandleInternalServerError(c, "Failed to load repository file", err.Error())
+		return
+	}
+
+	// 检查仓库是否存在
+	if !repoFile.Has(name) {
+		middleware.HandleNotFound(c, "Repository not found", fmt.Sprintf("Repository %s not found in Helm", name))
+		return
+	}
+
+	// 删除仓库
+	repoFile.Remove(name)
+
+	// 保存文件
+	if err := repoFile.WriteFile(repoFilePath, 0644); err != nil {
+		middleware.HandleInternalServerError(c, "Failed to save repository file", err.Error())
 		return
 	}
 
@@ -1050,7 +1183,7 @@ func (r *Router) deleteRepo(c *gin.Context) {
 	})
 }
 
-// refreshRepo 刷新仓库 - 通过helm repo update实现
+// refreshRepo 刷新仓库 - 需要下载索引文件，使用helm命令
 func (r *Router) refreshRepo(c *gin.Context) {
 	name := c.Param("name")
 

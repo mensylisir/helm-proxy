@@ -618,6 +618,11 @@ func (m *HelmManager) getActionConfig(namespace string) (*action.Configuration, 
 	return actionConfig, nil
 }
 
+// GetActionConfig 获取 Helm 操作配置（公开方法，供 router 使用）
+func (m *HelmManager) GetActionConfig(namespace string) (*action.Configuration, error) {
+	return m.getActionConfig(namespace)
+}
+
 // resolveChart 解析 externalId
 // 示例: catalog://?catalog=jrhelm&template=jianren-saas&version=0.1.54
 func (m *HelmManager) resolveChart(externalID string) (string, string, error) {
